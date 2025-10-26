@@ -1,0 +1,18 @@
+name: Trigger Lambda Redeploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger rebuild and redeploy workflow
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.ENGINE_PAT }}
+          repository: cmu-dsc/poker-infra
+          event-type: rebuild-engine
