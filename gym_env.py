@@ -267,8 +267,11 @@ class PokerEnv(gym.Env):
         self.last_street_bet = BLIND_AMOUNT
 
         obsListRaw = [self._get_single_player_obs(playerNum) for playerNum in range(NUM_PLAYERS)]
-        obsListFiltered = [obsItem for (obsItem, _) in obsListRaw]
+        obsListFiltered = tuple(obsItem for (obsItem, _) in obsListRaw)
         info = {}
+
+        #Need to maintain the type of self.observationSpace to match this
+        #Right now they're both tuples - they need to stay coherent
         return obsListFiltered, info
 
     def _next_street(self):
