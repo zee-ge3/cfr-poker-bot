@@ -164,7 +164,7 @@ cython_debug/
 .DS_Store
 *.zip
 *.csv
-*.txt
+# *.txt
 
 # Poker engine logs
 logs/
