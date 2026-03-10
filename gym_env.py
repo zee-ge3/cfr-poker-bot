@@ -132,6 +132,8 @@ class PokerEnv(gym.Env):
                 "min_raise": spaces.Discrete(self.MAX_PLAYER_BET, start=2),
                 "max_raise": spaces.Discrete(self.MAX_PLAYER_BET, start=2),
                 "valid_actions": spaces.MultiBinary(len(self.ActionType) - 1),
+                "pot_size": spaces.Discrete(2 * self.MAX_PLAYER_BET + 1),
+                "blind_position": spaces.Discrete(2),
             }
         )
 
@@ -187,6 +189,8 @@ class PokerEnv(gym.Env):
             "min_raise": self.min_raise,
             "max_raise": self.MAX_PLAYER_BET - max(self.bets),
             "valid_actions": self._get_valid_actions(player_num),
+            "pot_size": self.bets[0] + self.bets[1],
+            "blind_position": 1 if player_num == self.big_blind_player else 0,
         }
         # All in situation
         if obs["min_raise"] > obs["max_raise"]:

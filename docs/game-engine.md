@@ -65,7 +65,9 @@ Each player receives an observation dictionary containing:
     "opp_discarded_cards": Tuple[int, ...], # Opponent's 3 discarded cards (-1 until revealed)
     "min_raise": int,          # Minimum raise amount
     "max_raise": int,           # Maximum raise amount
-    "valid_actions": List[bool] # Which actions are currently valid
+    "valid_actions": List[bool], # Which actions are currently valid
+    "pot_size": int,           # Total chips in the pot (sum of both players' bets)
+    "blind_position": int      # Your position: 0 = small blind, 1 = big blind
 }
 ```
 
