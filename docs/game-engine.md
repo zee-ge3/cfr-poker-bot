@@ -80,14 +80,13 @@ RANKS = "23456789A"
 SUITS = "dhs"  # diamonds, hearts, spades
 ```
 
-Card index is `rank_index * 3 + suit_index`. Example mappings:
+Card index is **`suit_index * 9 + rank_index`** (rank index 0–8, suit index 0–2). Equivalently, `rank_index = card_int % 9`, `suit_index = card_int // 9`. Example mappings:
 
-- 0 = 2♦
-- 9 = 5♦
-- 10 = 5♥
-- 19 = 8♥
-- 20 = 8♠
-- 26 = A♠
+- 0 = 2♦ (suit 0, rank 0)
+- 3 = 5♦ (suit 0, rank 3)
+- 9 = 2♥ (suit 1, rank 0)
+- 24 = 8♠ (suit 2, rank 6)
+- 26 = A♠ (suit 2, rank 8)
 
 ## Game Flow
 
