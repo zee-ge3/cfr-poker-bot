@@ -152,17 +152,15 @@ class Claude2Agent(Agent):
 
     def _opp_bluff_rate(self) -> float:
         """
-        Rough bluff-rate estimate: when opp raises, fraction that are likely bluffs.
-        High overall raise-rate → some bluffs mixed in.
-        Low raise-rate → mostly value.
+        Fraction of opponent raises that are likely bluffs.
+        A "value-only" raiser raises ~25% of actions. Every percent above that
+        increases the bluff proportion proportionally.
+        rr=0.30 → ~17% bluffs; rr=0.40 → ~37%; rr=0.52 → ~52%.
         """
         rr = self._opp_aggression()
-        # If they raise >40% of actions, some must be bluffs (very wide range)
-        if rr > 0.45:
-            return 0.15
-        if rr > 0.35:
-            return 0.10
-        return 0.05  # conservative: assume mostly value
+        if rr <= 0.25:
+            return 0.05
+        return min(0.55, (rr - 0.25) / max(0.01, rr))
 
     def _opp_raises_often(self) -> bool:
         """True when opponent raises a very high fraction of their actions.
@@ -660,52 +658,6 @@ class Claude2Agent(Agent):
         aggr_call_floor -= early_factor * 0.05
         aggr_call_floor = max(0.28, aggr_call_floor)  # hard floor
 
-        # Context-aware aggr_call_floor adjustments (only when facing a real bet)
-        if facing and cost > 0:
-            # Bet size read: current raise vs opponent average sizing
-            current_raise_frac = cost / max(1, pot - cost)
-            avg_frac = self._opp_avg_raise_frac()
-            if current_raise_frac < 0.30 and avg_frac < 0.40:
-                # Habitual min-raiser making another min-raise = probe/bluff → call wider
-                aggr_call_floor -= 0.04
-            elif current_raise_frac > 0.80:
-                # Big raise = likely value → fold tighter
-                aggr_call_floor += 0.03
-
-            # Action line read: trap vs multi-barrel
-            if self._opp_line_is_trap():
-                aggr_call_floor += 0.04  # check-raise = slowplay → respect it
-            elif self._opp_line_is_barrel() and raises_often:
-                aggr_call_floor -= 0.03  # hyper-raiser multi-barrel = bluff continuation
-
-            # Board texture + discard pattern read
-            comm = [c for c in obs.get("community_cards", []) if c != -1]
-            if comm:
-                suit_cnt: dict = {}
-                rank_cnt: dict = {}
-                for c in comm:
-                    suit_cnt[c // NUM_RANKS] = suit_cnt.get(c // NUM_RANKS, 0) + 1
-                    rank_cnt[c % NUM_RANKS]  = rank_cnt.get(c % NUM_RANKS, 0) + 1
-                board_flush_heavy = max(suit_cnt.values()) >= 3
-                board_paired      = max(rank_cnt.values()) >= 2
-
-                if self._opp_is_flush_chaser():
-                    if board_flush_heavy:
-                        aggr_call_floor += 0.03  # raise more credible on flush board
-                    else:
-                        aggr_call_floor -= 0.02  # no flush potential → likely bluff
-                if self._opp_is_pair_keeper() and board_paired:
-                    aggr_call_floor += 0.03  # likely trips/full house on paired board
-
-                # Showdown flush rate: historical flush frequency vs current board texture
-                flush_rate = self._opp_sd_flush_rate()
-                if board_flush_heavy and flush_rate > 0.35:
-                    aggr_call_floor += 0.02  # frequently shows flushes; credible here
-                elif board_flush_heavy and flush_rate < 0.10:
-                    aggr_call_floor -= 0.02  # rarely shows flushes; likely bluffing
-
-            aggr_call_floor = max(0.28, aggr_call_floor)  # re-apply floor after adjustments
-
         # Against aggressive opponents: widen the pot-odds window for calls
         # (they're bluffing more, so call down lighter at better prices)
         max_call_pot_odds = 0.28 + max(0.0, (rr - 0.40) * 0.25)  # up to 0.35 vs very aggressive
@@ -907,39 +859,49 @@ class Claude2Agent(Agent):
                 return check() if can_check else fold()
 
         # ============================================================
-        # V2: Context-aware aggr_call_floor adjustments (bet size, action line,
-        # discard patterns, showdown hand types). Applied here so they affect
-        # FACING A BET logic only (NOT FACING section uses unadjusted floor).
+        # Context-aware aggr_call_floor adjustments — FACING A BET only.
+        # (NOT FACING section uses unadjusted floor via probe threshold.)
         # ============================================================
         if facing and cost > 0:
-            # Bet size read: small raise from habitual min-raiser = probe/bluff
+            # Bluff rate: higher raise frequency → more bluffs → call wider.
+            # At rr=0.30: bluff_rate≈0.17 (no effect); rr=0.40: ≈0.37 (-0.06);
+            # rr=0.52: ≈0.52 (-0.11). Dominant adjustment for aggressive opponents.
+            bluff_rate = self._opp_bluff_rate()
+            if bluff_rate > 0.20:
+                aggr_call_floor -= (bluff_rate - 0.20) * 0.35
+
+            # Bet size read: habitual min-raiser making another min-raise = probe
             current_raise_frac = cost / max(1, pot - cost)
             avg_frac = self._opp_avg_raise_frac()
             if current_raise_frac < 0.30 and avg_frac < 0.40:
-                aggr_call_floor -= 0.04   # min-raise = likely probe
+                aggr_call_floor -= 0.04   # min-raise = likely probe/bluff
             elif current_raise_frac > 0.80:
-                aggr_call_floor += 0.03   # big raise = more likely value
-        # Action line: check-raise trap deserves more respect; persistent barrel from
-        # hyper-raiser is more likely bluff continuation
-        if self._opp_line_is_trap():
-            aggr_call_floor += 0.04
-        if self._opp_line_is_barrel() and raises_often:
-            aggr_call_floor -= 0.03
-        # Discard pattern + board texture: flush-chaser behavior on flush/non-flush boards
-        board_cc = [c for c in obs.get("community_cards", []) if c != -1]
-        if board_cc:
-            board_suits = [c // NUM_RANKS for c in board_cc]
-            flush_board = max(board_suits.count(s) for s in set(board_suits)) >= 3
-            board_ranks = [c % NUM_RANKS for c in board_cc]
-            paired_board = len(set(board_ranks)) < len(board_ranks)
-            if self._opp_is_flush_chaser():
-                aggr_call_floor += 0.03 if flush_board else -0.02
-            if self._opp_is_pair_keeper() and paired_board:
-                aggr_call_floor += 0.03
-            # Showdown distribution: opp often shows flush on flush board = credible
-            if flush_board and self._opp_sd_flush_rate() > 0.35:
-                aggr_call_floor += 0.02
-        aggr_call_floor = max(0.28, aggr_call_floor)  # re-apply hard floor
+                aggr_call_floor += 0.03   # pot-size raise = likely value
+
+            # Action line: check-raise trap vs persistent barrel from hyper-raiser
+            if self._opp_line_is_trap():
+                aggr_call_floor += 0.04   # check-raise = slowplay → respect it
+            elif self._opp_line_is_barrel() and raises_often:
+                aggr_call_floor -= 0.03   # hyper-raiser multi-barrel = bluff continuation
+
+            # Board texture + discard pattern read
+            board_cc = [c for c in obs.get("community_cards", []) if c != -1]
+            if board_cc:
+                board_suits = [c // NUM_RANKS for c in board_cc]
+                flush_board = max(board_suits.count(s) for s in set(board_suits)) >= 3
+                board_ranks = [c % NUM_RANKS for c in board_cc]
+                paired_board = len(set(board_ranks)) < len(board_ranks)
+                if self._opp_is_flush_chaser():
+                    aggr_call_floor += 0.03 if flush_board else -0.02
+                if self._opp_is_pair_keeper() and paired_board:
+                    aggr_call_floor += 0.03
+                flush_rate = self._opp_sd_flush_rate()
+                if flush_board and flush_rate > 0.35:
+                    aggr_call_floor += 0.02   # frequently shows flushes; credible here
+                elif flush_board and flush_rate < 0.10:
+                    aggr_call_floor -= 0.02   # rarely shows flushes; likely bluffing
+
+            aggr_call_floor = max(0.26, aggr_call_floor)  # hard floor (was 0.28)
 
         # ============================================================
         # FACING A BET — conservative calling range.
