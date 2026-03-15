@@ -164,44 +164,60 @@ def preflop_strength(hole_5: tuple) -> float:
     return HAND_POTENTIAL_5[combo_index_5(sorted(hole_5))]
 ```
 
-### Rationality filter (best-2-from-5 correction)
+### Rationality filter (best-2-from-5 correction, FLOP-AWARE)
 
-Opponents are dealt 5 cards and keep their best 2. Naive enumeration of C(remaining, 2) treats
-them as if dealt 2 random cards — this overestimates our equity because it includes hands the
-opponent would never keep (e.g., 2d-4s when they had a pair available).
+Opponents are dealt 5 cards and keep their best 2 AFTER seeing the flop. Naive enumeration
+of C(remaining, 2) treats them as if dealt 2 random cards — this overestimates our equity
+because it includes hands the opponent would never keep.
 
-**Fix:** When opponent discards are known (post-discard streets), filter candidate hands:
+**Critical:** The filter MUST evaluate keep options against the actual flop, not pre-flop
+averages. Example: flop is 3d-4d-8d. Opponent was dealt [Ad,Kd,9s,9h,2c]. Pre-flop
+averages score 9s-9h (pair) higher than Ad-Kd (unpaired). But any rational player keeps
+Ad-Kd for the nut flush draw on a three-diamond flop. Using pre-flop averages would
+filter OUT the flush draw and produce catastrophically wrong equity.
+
+**Fix:** Evaluate each keep option's equity against the known flop using `exact_equity()`.
+This is called ONCE per hand (when building the filtered opponent range), not per-street:
 
 ```python
-def rational_opponent_hands(remaining, opp_discards):
-    """Yield only hands the opponent would rationally keep."""
+def rational_opponent_hands(remaining, opp_discards, flop):
+    """Yield only hands the opponent would rationally keep given the flop."""
     for hand in combinations(remaining, 2):
         # Reconstruct opponent's original 5-card deal
-        original_5 = sorted(list(hand) + list(opp_discards))
-        # Check all 10 keep options — would they have kept THIS pair?
-        best_strength = -1
+        original_5 = list(hand) + list(opp_discards)
+        # Evaluate all 10 keep options against ACTUAL FLOP
+        best_eq = -1
         best_keep = None
         for i, j in combinations(range(5), 2):
             keep = (original_5[i], original_5[j])
-            strength = HAND_STRENGTH_2[combo_index_2(sorted(keep))]
-            if strength > best_strength:
-                best_strength = strength
+            discard = [original_5[k] for k in range(5) if k not in (i, j)]
+            # Flop-aware equity: how strong is this keep ON THIS BOARD?
+            eq = exact_equity(keep, flop, discard)
+            if eq > best_eq:
+                best_eq = eq
                 best_keep = set(keep)
         if best_keep == set(hand):
             yield hand
 ```
 
-This uses `hand_strength_2` (average equity) as a proxy for discard decisions. Cost: 10 lookups
-per candidate hand × ~120 candidates = 1,200 extra lookups. Negligible.
+**Cost analysis:** For each candidate hand (~120), evaluate 10 keeps. Each keep evaluation
+calls `exact_equity(keep, flop, discard)` which enumerates ~C(16,2)×C(14,2) = ~10,920
+lookups. Total: 120 × 10 × 10,920 = ~13M lookups. At numpy speed (~100M lookups/sec),
+this completes in ~130ms.
 
-**Impact:** Typically filters from ~120 candidates down to ~30-50 consistent hands. This
-dramatically sharpens equity estimates — if the opponent discarded three low unsuited cards,
-we know they kept something strong, and our equity drops accordingly.
+This is called ONCE per hand (after opponent discards are revealed, before any post-flop
+equity calls). The filtered set is cached and reused for all subsequent equity calls
+on flop/turn/river. The 130ms cost is a one-time per-hand overhead — still far faster
+than current MC sampling (multiple 50-200ms calls per hand).
 
-**Limitation:** Uses average hand strength rather than flop-specific equity for keep evaluation.
-An opponent might keep suited cards over a pair on a flush-friendly flop. The learned
-`opp_weights_fn` preferences (suited, paired, etc.) correct for this partially. A v2
-improvement could use flop-aware keep evaluation via the hand_ranks table.
+**Optimization:** If 130ms is too slow for Phase 1 (500s budget), use a two-tier filter:
+1. Fast pre-filter using hand_strength_2 (eliminate obviously irrational keeps) → ~50 candidates
+2. Precise flop-aware filter on the remaining 50 → 50 × 10 × 10,920 = ~5.5M lookups = ~55ms
+
+**Impact:** Correctly handles flush draws, straight draws, and situational keeps that
+pre-flop averages would miss. Typically filters from ~120 candidates down to ~30-50
+consistent hands, with the RIGHT hands surviving (flush draws on flush boards, pairs
+on dry boards).
 
 ### Performance
 
@@ -304,7 +320,23 @@ def soft_decision(value, threshold, temp=0.04) -> float:
 
 Value raises: equity above value threshold (0.62 base, lowered vs folders).
 
-Bluff raises (THE key new feature): When `fold_rate_to_our_raise * pot > (1 - fold_rate) * raise_cost`, raising is +EV regardless of hand strength. Bluff probability proportional to profitability, capped at 0.40 for balance. Minimum equity: 0.10 (flop/turn), 0.20 (river). Bluff sizing: 0.60x pot center. Value sizing: 0.75x pot center. Both with ±25% jitter — ranges overlap (0.45-0.75x bluff, 0.56-0.94x value) so opponents cannot distinguish by size.
+Bluff raises (THE key new feature): Sizing is determined FIRST by `bet_size(pot, board, persona)`
+(board-texture-based, see Defense 4). Then the ACTUAL raise_cost is plugged into the EV formula:
+
+```python
+raise_amount = bet_size(pot, board, persona)  # board-texture sizing, NOT hand-dependent
+raise_cost = raise_amount
+bluff_ev = fold_rate * pot - (1 - fold_rate) * raise_cost
+```
+
+If `bluff_ev > 0`, raising is +EV regardless of hand strength. Bluff probability proportional
+to profitability, capped at persona["bluff_cap"] for balance. Minimum equity: 0.10 (flop/turn),
+0.20 (river).
+
+**Critical:** There is ONE sizing function (`bet_size`), used for BOTH bluffs and value.
+It outputs the same size for the same board regardless of hand strength. No separate
+bluff/value sizing — the counter-intelligence layer (Defense 4) and the strategy layer
+are unified, not contradictory.
 
 **Layer B: Should I call their raise? (Defense)**
 
@@ -322,17 +354,18 @@ When checked to us: probe threshold 0.45 base, drops to 0.20 vs folders. Through
 
 **Raise war cap:** If opponent re-raises our raise, require equity 0.65+ to continue (0.55 vs high bluff rate opponents).
 
-### Raise sizing (overlapping ranges — no dead zone)
+### Raise sizing (unified, board-texture-based)
 
-Sizing ranges MUST overlap so opponents cannot distinguish bluffs from value by bet size.
-A bet of 0.65x pot must be able to represent either.
+There is ONE sizing function used for ALL raises (value, bluff, probe). Sizing is
+determined by board texture and per-match persona, NOT by hand strength. See Defense 4
+for the full `bet_size()` implementation.
 
-- Bluff center: 0.60x pot, jitter ±25% → range 0.45x–0.75x
-- Value center: 0.75x pot, jitter ±25% → range 0.56x–0.94x
-- Overlap zone: 0.56x–0.75x (any bet in this range is ambiguous)
-- Reduced vs folders: 0.55x pot center (keep them calling)
-
-All jitter applied via uniform random. No sizing tells, no exploitable clustering.
+Key properties:
+- Same board → same size regardless of whether we hold the nuts or air
+- Wet boards → larger bets (0.70-0.95x pot). Dry boards → smaller bets (0.40-0.65x pot)
+- Per-match persona shifts the center ±0.10x, preventing cross-match clustering
+- ±20% jitter on top of everything
+- Zero correlation between bet size and hand strength → immune to clustering attacks
 
 ## Counter-Intelligence Layer (integrated across modules)
 
@@ -405,28 +438,34 @@ in personality is smaller than the variance in card distribution.
 **Threat:** Showdowns reveal ground truth about our range. If we only show down premium
 hands, opponents map our exact call/raise thresholds.
 
-**Fix:** With small probability (~3%), in LOW-STAKES unraised pots only, take a deliberately
-unusual line to reach showdown with an unexpected holding:
+**Fix:** Distribute poison across ALL pot sizes so opponents cannot filter by pot size.
+Frequency inversely proportional to pot size (poison cheap pots more, expensive pots rarely):
 
 ```python
-# In strategy.decide(), after normal decision:
-if (pot <= 6 and not facing_raise and street == 3
-    and random.random() < 0.03):
-    # "Noise showdown" — check-call to showdown with weak hand
-    # Only in tiny pots where EV cost is minimal
-    return call() if can_call else check()
+# In strategy.decide(), after normal decision computed:
+if street >= 2 and not facing_raise:
+    # Poison probability: higher in small pots, lower in large pots
+    # Small pots (<=8): ~4% chance. Medium (9-20): ~1.5%. Large (21+): ~0.3%
+    poison_prob = 0.04 * math.exp(-pot / 15.0)
+    if random.random() < poison_prob and equity < 0.35:
+        # Take suboptimal line to reach showdown with unexpected holding
+        return call() if can_call else check()
 ```
 
 **Constraints:**
-- ONLY in pots <= 6 chips (pre-flop blind + check-check lines)
-- NEVER when facing a raise (don't donate chips)
-- ONLY on river (minimize additional streets of bleeding)
-- ~3% frequency = ~3 hands per 1000-hand match
+- NEVER when facing a raise (don't donate chips to aggression)
+- Only when we have LOW equity (<0.35) — we're taking a bad hand to showdown
+- Frequency scales with pot size: ~4% in small pots, ~0.3% in large pots
+- Expected ~5-6 poison hands per 1000-hand match across all pot sizes
 
-**EV cost:** ~3 hands × ~3 chips = ~9 chips per match worst case. Trivial.
-**Information cost to opponent:** Their Bayesian bluff_rate and call_floor estimates get
-polluted by data points showing us at showdown with bottom pair. Their model over-adjusts,
-making suboptimal counter-plays against our real range.
+**EV cost:** ~5 hands × weighted avg ~5 chips = ~25 chips per match worst case.
+Small cost for major counter-intelligence value.
+
+**Why this is unfilterable:** Poison appears at pot sizes 4, 8, 12, 18, 25+. An opponent
+cannot set a single pot-size cutoff to exclude all poison without also excluding real data.
+Filtering by equity is impossible because they don't know our equity. Their only option
+is to accept the polluted data, which skews their Bayesian estimates of our call floors
+and range composition.
 
 ### Defense 4: Board-Texture Sizing (strategy.py)
 
@@ -471,8 +510,11 @@ poker AND better counter-intelligence.
 |---------|-------|---------|--------------------|
 | Discard stochasticity | equity.py | <0.006/hand | Exact hole card deduction |
 | Persona rotation | match_manager.py | ~0 | Cross-match threshold mapping |
-| Showdown poisoning | strategy.py | ~9 chips/match | Range and call-floor estimation |
+| Showdown poisoning | strategy.py | ~25 chips/match | Range and call-floor estimation |
 | Board-texture sizing | strategy.py | ~0 (better poker) | Bet size ↔ hand strength correlation |
+
+Total EV cost of all defenses: ~31 chips per 1000-hand match (~0.031 chips/hand).
+Negligible compared to the 100-500+ chips lost from being correctly read by opponents.
 
 ## Module 5: Match Manager (`match_manager.py`)
 
