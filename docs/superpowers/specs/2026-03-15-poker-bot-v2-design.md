@@ -423,12 +423,15 @@ If they notice we're over-bluffing, their fold_rate drops to near zero. Our Baye
 estimate lags by 10-20 hands, during which we hemorrhage chips bluffing into a calling station.
 
 The fix is a GTO bluff ceiling derived from our bet sizing. When betting `b` into pot `p`,
-the opponent needs equity `b / (p + 2b)` to call. To make them indifferent, our bluff frequency
-should not exceed `b / (p + b)` of our total betting range (MDF-derived bluff ratio):
+the opponent needs equity `b / (p + 2b)` to call. To make them indifferent, our range must
+contain `b / (p + b)` BLUFF-TO-VALUE ratio, which translates to a bluff *frequency* of
+`b / (p + 2b)` of our total betting range:
 
 ```python
 bet_frac = raise_cost / max(1, pot)
-gto_bluff_ratio = bet_frac / (1.0 + bet_frac)  # e.g., 0.75x pot → 43% bluffs
+gto_bluff_ratio = bet_frac / (1.0 + 2 * bet_frac)  # e.g., pot-sized bet → 33% bluffs
+# NOT bet_frac / (1 + bet_frac) — that is the MDF for the CALLER, not the bettor's bluff ratio
+# Pot-sized: 1/(1+2*1) = 33%. Half-pot: 0.5/(1+1) = 25%. 0.75x pot: 0.75/2.5 = 30%.
 ```
 
 The actual bluff probability is the MINIMUM of the exploitative and GTO ceilings:
@@ -494,7 +497,7 @@ is broken. Sizing dictates the required value-to-bluff ratio:
 ```python
 # After bet_size() determines the raise amount:
 bet_frac = raise_amount / max(1, pot)
-gto_value_ratio = 1.0 - bet_frac / (1.0 + bet_frac)  # e.g., 0.75x → 57% value
+gto_value_ratio = 1.0 - bet_frac / (1.0 + 2 * bet_frac)  # e.g., 0.75x → 70% value, pot-sized → 67%
 ```
 
 The strategy module tracks its own betting frequency per board-texture class (wet/medium/dry)
@@ -586,15 +589,38 @@ if street >= 2 and not facing_raise:
         return call() if can_call else check()
 ```
 
-**Vector B — Raised pots (we were the aggressor):**
+**Vector B — Raised pots (we were the aggressor), with `_poison_active` flag:**
+
+Vector B requires a dedicated state flag because simply calling `check()` doesn't guarantee
+the hand reaches showdown — if the opponent bets, standard strategy folds equity < 0.30,
+defeating the entire purpose.
+
 ```python
-# When we raised earlier in the hand and opponent called,
-# on a later street with weak equity, occasionally check-call to showdown:
-if street >= 2 and we_raised_earlier and not facing_raise:
+# In player.py __init__:
+self._poison_active = False  # persists across streets within a hand
+
+# Trigger: when we raised earlier and equity is low
+if street >= 2 and we_raised_earlier and not self._poison_active:
     poison_prob = 0.015 * math.exp(-pot / 20.0)
     if random.random() < poison_prob and equity < 0.30:
-        return check()  # let it check down to showdown with our bluff hand
+        self._poison_active = True  # FLAG THE HAND
+
+# On EVERY subsequent decision in the same hand:
+if self._poison_active:
+    if facing_raise:
+        return call()   # check-CALL even facing bets — forced showdown
+    else:
+        return check()  # check down when not facing bet
+    # This overrides standard strategy for the rest of the hand
+
+# Reset at hand end:
+# In _reset_hand_state(): self._poison_active = False
 ```
+
+**Why the flag is critical:** Without it, `check()` only works if the opponent also checks.
+If they bet (which they will in a raised pot), the poison hand hits standard strategy which
+folds equity < 0.30. The hand never reaches showdown. The data never gets poisoned. The flag
+forces check-call to showdown regardless of opponent action, guaranteeing data pollution.
 
 **Why Vector B is critical:** If poison only appears in passive/unraised pots, an opponent's
 `analyze_logs.py` simply filters: `if no_raise_in_hand: continue`. This isolates ALL poison
@@ -605,14 +631,14 @@ use to calibrate our raise ranges. This is irreparably corrupting.
 
 **Constraints:**
 - Vector A: Not facing a raise (don't donate to aggression), equity < 0.35
-- Vector B: Only when WE were the aggressor (we raised, they called). Never when facing
-  an opponent raise. equity < 0.30 (we're letting our bluff go to showdown)
+- Vector B: `_poison_active` flag forces check-call to showdown. Only triggered when WE
+  were the aggressor. equity < 0.30. Accepts the EV loss of calling down.
 - Both vectors scale inversely with pot size
 - Expected ~5-7 poison hands per 1000-hand match across all action lines
 
-**EV cost:** ~6 hands × weighted avg ~5 chips = ~30 chips per match worst case.
-Vector B actually costs LESS than it appears — we already raised (the expensive part),
-and we're just checking it down rather than folding, so the marginal cost is the check-call.
+**EV cost:** ~6 hands × weighted avg ~8 chips = ~48 chips per match worst case (higher than
+before because Vector B now actually reaches showdown via forced check-calls). Still small
+compared to 100-500+ chips lost from being correctly read.
 
 **Why this is unfilterable:** Poison appears in passive pots AND raised pots, across all
 pot sizes. An opponent cannot filter by pot size, cannot filter by "raised vs unraised,"
@@ -629,6 +655,18 @@ k-means clustering on 50+ matches will separate our ranges perfectly.
 the same sizing whether we have the nuts or air:
 
 ```python
+def _ace_wrap_connected(r1, r2):
+    """Check if two ranks are connected, handling Ace wraps in 27-card deck."""
+    diff = abs(r1 - r2)
+    if diff <= 2:
+        return True
+    # Ace (rank 8) wraps: A-2 (diff=8), A-3 (diff=7) are connected
+    # Also A-7, A-8, A-9 (Ace as 10 in 6-7-8-9-A straights)
+    if r1 == 8 or r2 == 8:
+        other = r2 if r1 == 8 else r1
+        return other <= 1 or other >= 6  # 2,3 (low) or 7,8,9 (high)
+    return False
+
 def bet_size(pot, board, persona):
     """Size based on board wetness, not hand strength."""
     suits = [c // 9 for c in board]
@@ -636,8 +674,11 @@ def bet_size(pot, board, persona):
 
     # Board wetness score: flush draws + straight draws + pairs
     flush_score = max(Counter(suits).values()) / len(board)  # 0.4-1.0
+    # CRITICAL: Use ace-wrap-aware connectivity, not raw rank difference
+    # Without this, A-2-3 board (ranks [0,1,8]) scores 0 connectivity
+    # despite being a highly wet straight-draw board
     connect_score = sum(1 for i in range(len(ranks)-1)
-                       if ranks[i+1] - ranks[i] <= 2) / max(1, len(ranks)-1)
+                       if _ace_wrap_connected(ranks[i], ranks[i+1])) / max(1, len(ranks)-1)
     wetness = (flush_score + connect_score) / 2  # 0.0 = dry, 1.0 = wet
 
     # Wet boards → larger bets (more draws to charge / more bluff equity)
@@ -663,10 +704,10 @@ poker AND better counter-intelligence.
 |---------|-------|---------|--------------------|
 | Discard stochasticity | equity.py | <0.006/hand | Exact hole card deduction |
 | Persona rotation | match_manager.py | ~0 | Cross-match threshold mapping |
-| Showdown poisoning (2 vectors) | strategy.py | ~30 chips/match | Range, call-floor, AND raise-range estimation |
+| Showdown poisoning (2 vectors + flag) | strategy.py | ~48 chips/match | Range, call-floor, AND raise-range estimation |
 | Board-texture sizing | strategy.py | ~0 (better poker) | Bet size ↔ hand strength correlation |
 
-Total EV cost of all defenses: ~36 chips per 1000-hand match (~0.036 chips/hand).
+Total EV cost of all defenses: ~54 chips per 1000-hand match (~0.054 chips/hand).
 Negligible compared to the 100-500+ chips lost from being correctly read by opponents.
 
 ## Module 5: Match Manager (`match_manager.py`)
