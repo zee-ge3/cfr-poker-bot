@@ -17,6 +17,7 @@ Strategy principles (no opponent-specific hardcoding):
      so probes have positive fold equity.
 """
 
+import math
 import random
 from itertools import combinations
 
@@ -74,8 +75,28 @@ class Claude2Agent(Agent):
         # _opp_subopt_bonus_sum: accumulated equity bonus from opp's suboptimal discards
         # _opp_subopt_count: showdowns where we had full 5-card opp data
         self._opp_showdown_scores: list = []
+        self._opp_passive_sd_scores: list = []  # showdowns where opp didn't raise (unbiased tightness)
+        self._opp_raised_this_hand: bool = False
         self._opp_subopt_bonus_sum: float = 0.0
         self._opp_subopt_count: int = 0
+
+        # Bet size tracking: list of (raise_amount, pot_size) tuples
+        self._opp_raise_sizes: list = []
+
+        # Per-hand action line (e.g. ['CHECK','RAISE'] = check-raise trap)
+        self._opp_hand_actions: list = []
+
+        # Discard pattern tracking across hands
+        self._opp_discard_data: dict = {
+            'kept_suited_count': 0,
+            'kept_pair_count': 0,
+            'discarded_pair_count': 0,
+            'total_observed': 0,
+        }
+        self._opp_discards_analyzed: bool = False  # per-hand flag to analyze once
+
+        # Showdown hand type distribution
+        self._opp_sd_hand_types: dict = {}
 
     def __name__(self):
         return "Claude2Agent"
@@ -178,17 +199,33 @@ class Claude2Agent(Agent):
     #  Showdown range learning                                             #
     # ------------------------------------------------------------------ #
 
+    def _soft_thr(self, equity: float, thr: float, temp: float = 0.04) -> bool:
+        """Probabilistic threshold using sigmoid curve.
+
+        P(action) = sigmoid((equity - thr) / temp)
+        At equity=thr: 50%. At thr+2*temp: ~88%. At thr-2*temp: ~12%.
+        Replaces hard cutoffs with smooth transitions to prevent exploitation.
+        """
+        x = (equity - thr) / max(0.001, temp)
+        try:
+            p = 1.0 / (1.0 + math.exp(-x))
+        except OverflowError:
+            p = 1.0 if x > 0 else 0.0
+        return random.random() < p
+
     def _opp_avg_showdown_score(self) -> float:
         """Average treys score at opponent showdowns. Lower = stronger hand.
         Neutral prior 3500 (mid-pair range) until we have enough data."""
-        if len(self._opp_showdown_scores) < 5:
+        scores = self._opp_passive_sd_scores  # unbiased: opp passive hands only
+        if len(scores) < 5:
             return 3500.0
-        return sum(self._opp_showdown_scores) / len(self._opp_showdown_scores)
+        return sum(scores) / len(scores)
 
     def _opp_showdown_tight(self) -> bool:
-        """True if opp only shows down with strong hands (avg score < 2800).
-        In 27-card deck: trips=1610-2467, flush=323-1599, pair=3326-6185.
-        Tight opp has value-heavy range → we need stronger hand to call raises."""
+        """True if opp only shows down with strong hands when passive (avg score < 2800).
+        Uses only non-raising showdowns to avoid selection bias: if opp raises 70% of hands,
+        showdowns skew toward their value range, not their overall calling range.
+        In 27-card deck: trips=1610-2467, flush=323-1599, pair=3326-6185."""
         return self._opp_avg_showdown_score() < 2800
 
     def _opp_suboptimality_bonus(self) -> float:
@@ -199,6 +236,63 @@ class Claude2Agent(Agent):
         if self._opp_subopt_count < 5:
             return 0.0
         return min(0.04, self._opp_subopt_bonus_sum / self._opp_subopt_count)
+
+    # ------------------------------------------------------------------ #
+    #  Bet size, action line, discard pattern, showdown hand type          #
+    # ------------------------------------------------------------------ #
+
+    def _opp_avg_raise_frac(self) -> float:
+        """Average opponent raise as fraction of pot. <0.35 = min-raiser, >0.70 = value-heavy."""
+        if len(self._opp_raise_sizes) < 5:
+            return 0.50
+        return sum(sz / max(1, p) for sz, p in self._opp_raise_sizes) / len(self._opp_raise_sizes)
+
+    def _opp_line_is_trap(self) -> bool:
+        """Opp checked an earlier street then raised — classic slowplay/check-raise."""
+        acts = self._opp_hand_actions
+        return len(acts) >= 2 and 'CHECK' in acts[:-1] and acts[-1] == 'RAISE'
+
+    def _opp_line_is_barrel(self) -> bool:
+        """Opp raised on 2+ streets this hand — persistent aggression."""
+        return sum(1 for a in self._opp_hand_actions if a == 'RAISE') >= 2
+
+    def _analyze_opp_discards(self, opp_discards: list) -> None:
+        """Deduce what opponent likely kept from their 3 discarded cards."""
+        from collections import Counter
+        cards = [c for c in opp_discards if c != -1]
+        if len(cards) != 3:
+            return
+        self._opp_discard_data['total_observed'] += 1
+        ranks = [c % NUM_RANKS for c in cards]
+        suits = [c // NUM_RANKS for c in cards]
+        rank_counts = Counter(ranks)
+        suit_counts = Counter(suits)
+        if max(rank_counts.values()) >= 2:
+            self._opp_discard_data['discarded_pair_count'] += 1
+        # All 3 different suits → kept cards likely share a suit (flush draw)
+        if len(suit_counts) == 3:
+            self._opp_discard_data['kept_suited_count'] += 1
+        # No pair in discards and not all different suits → likely kept a pair
+        elif max(rank_counts.values()) == 1:
+            self._opp_discard_data['kept_pair_count'] += 1
+
+    def _opp_is_flush_chaser(self) -> bool:
+        total = self._opp_discard_data['total_observed']
+        return total >= 15 and self._opp_discard_data['kept_suited_count'] / total > 0.45
+
+    def _opp_is_pair_keeper(self) -> bool:
+        total = self._opp_discard_data['total_observed']
+        return total >= 15 and self._opp_discard_data['kept_pair_count'] / total > 0.40
+
+    def _opp_sd_flush_rate(self) -> float:
+        """Fraction of showdowns where opp had flush or better."""
+        total = sum(self._opp_sd_hand_types.values())
+        if total < 8:
+            return 0.20
+        flush_plus = (self._opp_sd_hand_types.get('flush', 0) +
+                      self._opp_sd_hand_types.get('full_house', 0) +
+                      self._opp_sd_hand_types.get('straight_flush', 0))
+        return flush_plus / total
 
     # ------------------------------------------------------------------ #
     #  Bayesian call-threshold estimation                                  #
@@ -529,6 +623,18 @@ class Claude2Agent(Agent):
         pressure    = self._match_pressure()   # +1=desperate, -1=comfortable lead
         in_protection = (pressure < -0.10)
 
+        # ============================================================
+        # EARLY GAME AGGRESSION + SMOOTH AGGRESSION CURVE
+        # Early hands: variance is cheap (1000 hands remaining), early leads create
+        # chokehold once protection mode activates. Play wider/bigger early.
+        # Smooth ±20% jitter prevents opponents detecting phase transitions.
+        # Suppressed in protection mode (already winning — minimize variance).
+        # ============================================================
+        hands_played = self._hands_played
+        early_factor = max(0.0, 1.0 - hands_played / 300.0)
+        early_factor = max(0.0, early_factor * (1.0 + random.uniform(-0.20, 0.20)))
+        aggression = 0.0 if in_protection else max(early_factor, max(0.0, pressure) * 0.8)
+
         # Continuous fold rate for probe sizing (0.0-1.0)
         real = self._bet_outcomes[2:]
         fold_rate = (sum(1 for _, c in real if not c) / len(real)) if len(real) >= 4 else 0.35
@@ -537,13 +643,65 @@ class Claude2Agent(Agent):
         oop = (obs.get("blind_position", 0) == 1)
 
         # Aggression-aware facing-bet call floor.
-        # Calibrated for best-2-from-5 MC equity scale where:
-        #   trips ≈ 0.45-0.52, flush ≈ 0.51, low FH ≈ 0.69, high FH ≈ 0.83-0.97
-        # Base floor 0.50; rises vs passive opps (strong hand range), falls vs aggressive.
+        # CRITICAL FIX: previous floor 0.40 too high — opponents exploited 75-83% fold-to-raise
+        # by min-raising every flop. Floor now 0.36 (continuous) with raises_often direct drop.
+        # aggression (early game / desperation): call wider when variance is acceptable.
         if rr > 0.45:
-            aggr_call_floor = max(0.40, 0.50 - (rr - 0.45) * 0.40 - pressure * 0.04)
+            aggr_call_floor = max(0.36, 0.50 - (rr - 0.45) * 0.56 - pressure * 0.04)
         else:
             aggr_call_floor = 0.50 + max(0.0, (0.35 - rr) * 0.22) - pressure * 0.04
+        # raises_often: their range is too wide → drop threshold directly
+        if raises_often:
+            aggr_call_floor -= 0.06
+        # Early game / desperation: call wider when variance is acceptable
+        aggr_call_floor -= aggression * 0.05
+        aggr_call_floor = max(0.28, aggr_call_floor)  # hard floor
+
+        # Context-aware aggr_call_floor adjustments (only when facing a real bet)
+        if facing and cost > 0:
+            # Bet size read: current raise vs opponent average sizing
+            current_raise_frac = cost / max(1, pot - cost)
+            avg_frac = self._opp_avg_raise_frac()
+            if current_raise_frac < 0.30 and avg_frac < 0.40:
+                # Habitual min-raiser making another min-raise = probe/bluff → call wider
+                aggr_call_floor -= 0.04
+            elif current_raise_frac > 0.80:
+                # Big raise = likely value → fold tighter
+                aggr_call_floor += 0.03
+
+            # Action line read: trap vs multi-barrel
+            if self._opp_line_is_trap():
+                aggr_call_floor += 0.04  # check-raise = slowplay → respect it
+            elif self._opp_line_is_barrel() and raises_often:
+                aggr_call_floor -= 0.03  # hyper-raiser multi-barrel = bluff continuation
+
+            # Board texture + discard pattern read
+            comm = [c for c in obs.get("community_cards", []) if c != -1]
+            if comm:
+                suit_cnt: dict = {}
+                rank_cnt: dict = {}
+                for c in comm:
+                    suit_cnt[c // NUM_RANKS] = suit_cnt.get(c // NUM_RANKS, 0) + 1
+                    rank_cnt[c % NUM_RANKS]  = rank_cnt.get(c % NUM_RANKS, 0) + 1
+                board_flush_heavy = max(suit_cnt.values()) >= 3
+                board_paired      = max(rank_cnt.values()) >= 2
+
+                if self._opp_is_flush_chaser():
+                    if board_flush_heavy:
+                        aggr_call_floor += 0.03  # raise more credible on flush board
+                    else:
+                        aggr_call_floor -= 0.02  # no flush potential → likely bluff
+                if self._opp_is_pair_keeper() and board_paired:
+                    aggr_call_floor += 0.03  # likely trips/full house on paired board
+
+                # Showdown flush rate: historical flush frequency vs current board texture
+                flush_rate = self._opp_sd_flush_rate()
+                if board_flush_heavy and flush_rate > 0.35:
+                    aggr_call_floor += 0.02  # frequently shows flushes; credible here
+                elif board_flush_heavy and flush_rate < 0.10:
+                    aggr_call_floor -= 0.02  # rarely shows flushes; likely bluffing
+
+            aggr_call_floor = max(0.28, aggr_call_floor)  # re-apply floor after adjustments
 
         # Against aggressive opponents: widen the pot-odds window for calls
         # (they're bluffing more, so call down lighter at better prices)
@@ -578,9 +736,9 @@ class Claude2Agent(Agent):
         # Pressure adjustments: desperate → raise/call wider; comfortable → tighter.
         # ============================================================
         if street == 0:
-            pf_raise_thr = 0.68 - pressure * 0.03   # ~0.65 when desperate, ~0.71 when safe
-            pf_open_thr  = 0.57 - pressure * 0.02   # ~0.55 desperate, ~0.59 safe
-            pf_call_thr  = 0.47 - pressure * 0.02
+            pf_raise_thr = 0.68 - pressure * 0.03 - aggression * 0.04
+            pf_open_thr  = 0.57 - pressure * 0.02 - aggression * 0.04
+            pf_call_thr  = 0.47 - pressure * 0.02 - aggression * 0.06
 
             # Distinguish BB's forced blind from a voluntary raise.
             # When SB acts first, cost=1 (BB's blind). When BB acts after SB limp, cost=0.
@@ -634,14 +792,14 @@ class Claude2Agent(Agent):
         # In 27-card deck, flushes are common → 0.80+ is the true "strong" bar.
         # Bet selectively; don't inflate pots with marginal leads.
         # ============================================================
+        # Early game: bet bigger to build larger pots when variance is acceptable.
+        early_bet_mult = 1.0 + aggression * 0.20  # up to 1.20x early, 1.0x after hand 300
+
         if not facing:
-            if equity >= 0.83:
+            if self._soft_thr(equity, 0.83 - aggression * 0.02, 0.02):
                 # Near-lock: big value bet. Bet bigger vs calling stations.
                 # Slow-play 10% of the time on flop/turn (not river) to vary our range
                 # and build pots via check-raise or induce bluffs.
-                # OOP slow-play slightly more often: we'll check, they bet, we raise.
-                # Only slow-play vs folders: they might bluff into our check, building pot.
-                # vs stations: never slow-play — they call but don't bluff, so checking loses value.
                 slow_play = (street < 3
                              and equity >= 0.90
                              and folds_often
@@ -650,24 +808,21 @@ class Claude2Agent(Agent):
                     self.logger.info(f"SLOW-PLAY s={street} eq={equity:.2f}")
                     return check()
                 if street < 3:
-                    frac = 0.65 if folds_often else 0.92  # stations call → extract max on flop/turn
+                    frac = (0.65 if folds_often else 0.92) * early_bet_mult
                 else:
-                    frac = 0.88 if folds_often else 1.05  # overbet river vs station (they call)
+                    frac = (0.88 if folds_often else 1.05) * early_bet_mult
                 if can_raise:
-                    return self._bet(obs, frac, "VALUE-LARGE")
+                    return self._bet(obs, min(frac, 1.50), "VALUE-LARGE")
                 return check() if can_check else call()
 
-            elif equity >= 0.63 and not in_protection:
+            elif self._soft_thr(equity, 0.63 - aggression * 0.02, 0.03) and not in_protection:
                 # Strong: standard value bet (low FH qualifies; flush/trips do not).
-                # Calibrated for best-2-from-5 MC: low FH ≈ 0.69, flush ≈ 0.51.
-                # Protection mode: check instead — let opp bet at their size;
-                # we call at better pot_odds than we'd face after a raise on our bet.
                 if street < 3:
-                    frac = 0.55 if folds_often else 0.80  # stations call → extract max on flop/turn
+                    frac = (0.55 if folds_often else 0.80) * early_bet_mult
                 else:
-                    frac = 0.75 if folds_often else 0.90  # larger river value vs station
+                    frac = (0.75 if folds_often else 0.90) * early_bet_mult
                 if can_raise:
-                    return self._bet(obs, frac, "VALUE-STD")
+                    return self._bet(obs, min(frac, 1.20), "VALUE-STD")
                 return check() if can_check else call()
 
             elif street < 3 and equity >= aggr_call_floor + (0.0 if folds_often else 0.03) + oop_extra - pressure * 0.03:
@@ -696,8 +851,9 @@ class Claude2Agent(Agent):
                 # Flop: 60% of turn freq (more streets ahead = more conservative commitment).
                 # EV always positive vs folder: higher multiplier extracts more.
                 # Self-regulating: if opp calls more, fold_rate drops → folds_often flips False.
-                steal_freq = min(0.65, fold_rate * 0.90 + max(0.0, pressure * 0.08))
-                if not oop:  steal_freq = min(0.78, steal_freq * 1.15)  # IP steals more
+                steal_freq = min(0.65 + aggression * 0.10,
+                                fold_rate * 0.90 + max(0.0, pressure * 0.08) + aggression * 0.15)
+                if not oop:  steal_freq = min(0.78 + aggression * 0.07, steal_freq * 1.15)
                 if street == 1:  steal_freq *= 0.60  # flop: reduce for multi-street commitment
                 if random.random() < steal_freq:
                     return self._bet(obs, 0.30, "STEAL")
@@ -747,6 +903,41 @@ class Claude2Agent(Agent):
                 return check() if can_check else fold()
 
         # ============================================================
+        # V2: Context-aware aggr_call_floor adjustments (bet size, action line,
+        # discard patterns, showdown hand types). Applied here so they affect
+        # FACING A BET logic only (NOT FACING section uses unadjusted floor).
+        # ============================================================
+        if facing and cost > 0:
+            # Bet size read: small raise from habitual min-raiser = probe/bluff
+            current_raise_frac = cost / max(1, pot - cost)
+            avg_frac = self._opp_avg_raise_frac()
+            if current_raise_frac < 0.30 and avg_frac < 0.40:
+                aggr_call_floor -= 0.04   # min-raise = likely probe
+            elif current_raise_frac > 0.80:
+                aggr_call_floor += 0.03   # big raise = more likely value
+        # Action line: check-raise trap deserves more respect; persistent barrel from
+        # hyper-raiser is more likely bluff continuation
+        if self._opp_line_is_trap():
+            aggr_call_floor += 0.04
+        if self._opp_line_is_barrel() and raises_often:
+            aggr_call_floor -= 0.03
+        # Discard pattern + board texture: flush-chaser behavior on flush/non-flush boards
+        board_cc = [c for c in obs.get("community_cards", []) if c != -1]
+        if board_cc:
+            board_suits = [c // NUM_RANKS for c in board_cc]
+            flush_board = max(board_suits.count(s) for s in set(board_suits)) >= 3
+            board_ranks = [c % NUM_RANKS for c in board_cc]
+            paired_board = len(set(board_ranks)) < len(board_ranks)
+            if self._opp_is_flush_chaser():
+                aggr_call_floor += 0.03 if flush_board else -0.02
+            if self._opp_is_pair_keeper() and paired_board:
+                aggr_call_floor += 0.03
+            # Showdown distribution: opp often shows flush on flush board = credible
+            if flush_board and self._opp_sd_flush_rate() > 0.35:
+                aggr_call_floor += 0.02
+        aggr_call_floor = max(0.28, aggr_call_floor)  # re-apply hard floor
+
+        # ============================================================
         # FACING A BET — conservative calling range.
         # When they bet/raise, their range is concentrated upward.
         # Only continue with genuinely strong hands or excellent price.
@@ -782,24 +973,28 @@ class Claude2Agent(Agent):
             return fold() if can_fold else check()
 
         # Rules 3-5 evaluate independently (no elif) so fall-through works correctly.
+        # Probabilistic gray zones: soft thresholds prevent exploitation of hard cutoffs.
         # Rule 3: Decent flop/turn equity at favorable price
-        if equity >= aggr_call_floor and not river_only_value:
+        if self._soft_thr(equity, aggr_call_floor, 0.04) and not river_only_value:
             if pot_odds <= max_call_pot_odds and can_call:
                 return call()
             # pot too expensive here; fall through to rule 4 for wider window check
 
         # Rule 4: Pot-odds profitable call (covers rule 3 fall-through + river)
-        # Widened vs aggressive opponents: high rr → wider bet range (more bluffs) →
-        # our absolute equity is closer to effective equity vs their range.
-        rule4_thr = max(0.38, 0.47 - max(0.0, (rr - 0.35) * 0.24))
-        # Extend pot_odds limit to 0.45: at equity=0.55/pot_odds=0.40, EV=+0.62P — currently folded.
-        # Cushion pot_odds+0.05 ensures we need meaningful edge above break-even before calling.
-        if equity >= max(pot_odds + 0.05, rule4_thr) and pot_odds <= 0.45 and can_call:
+        # FIXED: floor lowered from 0.38 to 0.33 vs aggressive opponents.
+        # raises_often direct drop: their range is too wide to call tight.
+        rule4_floor = max(0.33, 0.38 - max(0.0, (rr - 0.45) * 0.25))
+        if raises_often:
+            rule4_floor = max(0.28, rule4_floor - 0.04)
+        rule4_floor -= aggression * 0.04
+        rule4_thr = max(rule4_floor, 0.47 - max(0.0, (rr - 0.35) * 0.24))
+        if self._soft_thr(equity, max(pot_odds + 0.05, rule4_thr), 0.03) and pot_odds <= 0.45 and can_call:
             return call()
 
-        # Rule 5: Marginal equity at cheap price — call if we're ahead of pot odds.
-        # Extend pot_odds to 0.25: eq=0.44 at 0.23 = +0.19P; old limit missed this.
-        if equity >= max(pot_odds + 0.04, 0.40) and pot_odds <= 0.25 and can_call:
+        # Rule 5: Marginal equity at cheap price.
+        # FIXED: pot_odds limit extended from 0.25 to 0.30 base, scales with rr.
+        rule5_po_limit = min(0.35, 0.25 + max(0.0, (rr - 0.40) * 0.25) + aggression * 0.05)
+        if equity >= max(pot_odds + 0.04, 0.40) and pot_odds <= rule5_po_limit and can_call:
             return call()
 
         return fold() if can_fold else check()
@@ -877,14 +1072,32 @@ class Claude2Agent(Agent):
         opp_last = str(observation.get("opp_last_action", ""))
         if "RAISE" in opp_last:
             self._opp_raise_count += 1
+            self._opp_raised_this_hand = True
+            # Bet size tracking: record raise amount relative to pot
+            my_bet  = observation.get("my_bet", 0)
+            opp_bet = observation.get("opp_bet", 0)
+            pot     = observation.get("pot_size", my_bet + opp_bet)
+            raise_sz = opp_bet - my_bet
+            if pot > 0 and raise_sz > 0:
+                self._opp_raise_sizes.append((raise_sz, pot))
+                if len(self._opp_raise_sizes) > 200:
+                    self._opp_raise_sizes = self._opp_raise_sizes[-200:]
+            self._opp_hand_actions.append('RAISE')
         elif opp_last == "CALL":
             self._opp_call_count += 1
+            self._opp_hand_actions.append('CALL')
         elif opp_last == "CHECK":
             self._opp_check_count += 1
+            self._opp_hand_actions.append('CHECK')
         elif opp_last == "FOLD":
             self._opp_fold_count += 1
 
         self._resolve_bet(opp_last)
+
+        # Once per hand: analyze opp discards to build pattern knowledge
+        if not self._opp_discards_analyzed and any(c != -1 for c in opp_discards):
+            self._analyze_opp_discards(opp_discards)
+            self._opp_discards_analyzed = True
 
         # ---- DISCARD ----
         if valid[AT.DISCARD.value]:
@@ -899,6 +1112,11 @@ class Claude2Agent(Agent):
 
         # ---- BETTING ----
         excl = [c for c in opp_discards if c != -1]
+
+        # Analyze opponent discards once per hand on first post-flop step
+        if street > 0 and not self._opp_discards_analyzed and any(c != -1 for c in opp_discards):
+            self._analyze_opp_discards(opp_discards)
+            self._opp_discards_analyzed = True
 
         if street == 0:
             if len(my_cards) == 5:
@@ -950,6 +1168,11 @@ class Claude2Agent(Agent):
         if terminated:
             self._hands_played += 1
             self._cumulative_reward += reward
+            # Reset per-hand state. Must happen in terminated block (not just in
+            # showdown block) so non-showdown hands (folds) also reset correctly.
+            self._opp_raised_this_hand = False
+            self._opp_hand_actions = []
+            self._opp_discards_analyzed = False
             if reward != 0:
                 self.logger.info(
                     f"{'WON' if reward > 0 else 'LOST'} {abs(reward)} chips "
@@ -975,8 +1198,22 @@ class Claude2Agent(Agent):
                     opp_kept_t = [int_to_card(_CARD_STR_TO_INT[s]) for s in opp_kept_strs]
                     board_t    = [int_to_card(_CARD_STR_TO_INT[s]) for s in board_strs]
                     score = self.evaluator.evaluate(opp_kept_t, board_t)
+                    # Classify showdown hand type for distribution tracking
+                    if score <= 10:      hand_type = 'straight_flush'
+                    elif score <= 322:   hand_type = 'full_house'
+                    elif score <= 1599:  hand_type = 'flush'
+                    elif score <= 1609:  hand_type = 'straight'
+                    elif score <= 2467:  hand_type = 'trips'
+                    elif score <= 3325:  hand_type = 'two_pair'
+                    elif score <= 6185:  hand_type = 'pair'
+                    else:                hand_type = 'high_card'
+                    self._opp_sd_hand_types[hand_type] = self._opp_sd_hand_types.get(hand_type, 0) + 1
                     self._opp_showdown_scores.append(score)
-
+                    # Unbiased tightness sample: only record passive showdowns.
+                    # If opp raised this hand, their showdown cards skew toward value,
+                    # not their overall range — would falsely trigger showdown_tight.
+                    if not self._opp_raised_this_hand:
+                        self._opp_passive_sd_scores.append(score)
                     # Suboptimality check: did opp keep their best 2-card hand?
                     # opp_discarded_cards in obs = the 3 cards they threw away.
                     opp_disc_ints = [c for c in observation.get("opp_discarded_cards", [])
@@ -1006,3 +1243,5 @@ class Claude2Agent(Agent):
                     )
                 except (KeyError, Exception) as e:
                     self.logger.warning(f"SHOWDOWN parse error: {e}")
+            # Reset per-hand flag after showdown data is captured
+            self._opp_raised_this_hand = False
