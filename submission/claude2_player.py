@@ -31,6 +31,9 @@ NUM_RANKS   = len(PokerEnv.RANKS)
 # Tiny residual discount after MC already models opp's best-2-from-5 selection.
 EQ_DISCOUNT_BASE = 0.02
 
+# Reverse lookup: card string → our int encoding (for showdown parsing)
+_CARD_STR_TO_INT = {PokerEnv.int_card_to_str(i): i for i in range(DECK_SIZE)}
+
 
 class Claude2Agent(Agent):
     def __init__(self, stream: bool = True):
@@ -65,6 +68,14 @@ class Claude2Agent(Agent):
         self._cumulative_reward   = 0.0
         self._hands_played        = 0
         self._total_hands         = 1000
+
+        # Showdown & discard learning
+        # _opp_showdown_scores: treys hand scores seen at showdown (lower = stronger)
+        # _opp_subopt_bonus_sum: accumulated equity bonus from opp's suboptimal discards
+        # _opp_subopt_count: showdowns where we had full 5-card opp data
+        self._opp_showdown_scores: list = []
+        self._opp_subopt_bonus_sum: float = 0.0
+        self._opp_subopt_count: int = 0
 
     def __name__(self):
         return "Claude2Agent"
@@ -164,6 +175,32 @@ class Claude2Agent(Agent):
         return self._opp_fold_count / facing > 0.45
 
     # ------------------------------------------------------------------ #
+    #  Showdown range learning                                             #
+    # ------------------------------------------------------------------ #
+
+    def _opp_avg_showdown_score(self) -> float:
+        """Average treys score at opponent showdowns. Lower = stronger hand.
+        Neutral prior 3500 (mid-pair range) until we have enough data."""
+        if len(self._opp_showdown_scores) < 5:
+            return 3500.0
+        return sum(self._opp_showdown_scores) / len(self._opp_showdown_scores)
+
+    def _opp_showdown_tight(self) -> bool:
+        """True if opp only shows down with strong hands (avg score < 2800).
+        In 27-card deck: trips=1610-2467, flush=323-1599, pair=3326-6185.
+        Tight opp has value-heavy range → we need stronger hand to call raises."""
+        return self._opp_avg_showdown_score() < 2800
+
+    def _opp_suboptimality_bonus(self) -> float:
+        """Equity bonus from opp keeping suboptimal cards at discard.
+        MC models opp as always keeping their best 2-card hand. When opp keeps
+        a weaker hand than optimal, our real equity exceeds the MC estimate.
+        Returns average bonus per hand, capped at 0.04."""
+        if self._opp_subopt_count < 5:
+            return 0.0
+        return min(0.04, self._opp_subopt_bonus_sum / self._opp_subopt_count)
+
+    # ------------------------------------------------------------------ #
     #  Bayesian call-threshold estimation                                  #
     # ------------------------------------------------------------------ #
 
@@ -213,21 +250,37 @@ class Claude2Agent(Agent):
     def _n_samples(self, base: int) -> int:
         """Scale MC samples to available time budget.
 
-        phase_mult=1: Phase 1 (500s)  — base counts.
-        phase_mult=2: Phase 2 (1000s) — 1.5x samples (more accurate equity).
-        phase_mult=3: Phase 3 (1500s) — 2.5x samples (best accuracy).
-        phase_mult=9: Simulation (9999s) — base counts (sim speed matters).
-        Emergency taper applies when time critically low.
+        Dynamic scaling: computes per-hand time budget from time_left / remaining_hands
+        and targets 40% of that budget for this MC call. Caps scale with phase.
+
+        phase_mult=9 (simulation): always base counts for reproducibility/speed.
+        Emergency taper kicks in when time critically low (<250s remaining).
         """
         t = self._time_left
-        if t < 60:  return max(5,  base // 8)
-        if t < 150: return max(10, base // 4)
-        if t < 250: return max(20, base // 2)
-        if self._phase_mult == 3:  # Phase 3 (1500s) — 4 vCPU, use full accuracy
-            return min(int(base * 2.5), 150)
-        if self._phase_mult == 2:  # Phase 2 (1000s) — 2 vCPU
-            return min(int(base * 1.5), 100)
-        return base
+        remaining = max(1, self._total_hands - self._hands_played)
+        per_hand_sec = t / remaining
+
+        # Emergency taper: rate-based — kick in when per-hand budget is tiny.
+        # Absolute t < 10s is a hard floor regardless of remaining hands.
+        if t < 10 or per_hand_sec < 0.02: return max(5,  base // 8)
+        if per_hand_sec < 0.05:           return max(10, base // 4)
+        if per_hand_sec < 0.10:           return max(20, base // 2)
+
+        # Simulation mode: base counts for speed
+        if self._phase_mult == 9:
+            return base
+
+        # Per-hand time budget → sample count budget
+        # Empirical: ~16000 samples/sec on match server → target 40% of per-hand time
+        budget = int(per_hand_sec * 16000 * 0.40)
+
+        # Phase caps: higher phase = more time/vCPU → allow more samples
+        if self._phase_mult == 3:  # Phase 3 (1500s, 4 vCPU)
+            return max(base, min(budget, base * 25))
+        if self._phase_mult == 2:  # Phase 2 (1000s, 2 vCPU)
+            return max(base, min(budget, base * 20))
+        # Phase 1 (500s): cap at 15x base; budget formula handles graceful taper
+        return max(base, min(budget, base * 15))
 
     # ------------------------------------------------------------------ #
     #  Monte Carlo equity                                                  #
@@ -501,6 +554,10 @@ class Claude2Agent(Agent):
         # vs aggressive (rr > 0.40): re-raise lighter to deny equity and punish bluffs
         # pressure: desperate (+) → lower thresholds; comfortable lead (-) → higher
         reraise_thr      = max(0.58, 0.72 - max(0.0, (rr - 0.40) * 0.30) - pressure * 0.04)
+        # Tight showdown range: opp only shows up with strong hands → need stronger
+        # hand to call/reraise their bets. Raise threshold by 0.04.
+        if self._opp_showdown_tight():
+            reraise_thr = min(reraise_thr + 0.04, 0.85)
         # Lower reraise_fold_thr: at fold_rate=0.55, reraise 0.75P is profitable at any eq>0.30.
         # EV(reraise,eq=0.50) = 0.55*(P+C) + 0.45*0.55*(P+C) = 0.80*(P+C) >> EV(call)=0.38P.
         reraise_fold_thr = max(0.40, 0.50 - max(0.0, (rr - 0.40) * 0.40) - pressure * 0.04)
@@ -859,6 +916,9 @@ class Claude2Agent(Agent):
             equity = self._equity(my_cards, community_cards, excl, n=self._n_samples(n_base))
             # Small residual discount on top of MC (which already models best-2-from-5)
             equity = max(0.0, equity - self._board_discount(community_cards))
+            # Suboptimality bonus: if opp historically keeps weaker cards than optimal,
+            # our MC equity understates our true win rate. Apply learned correction.
+            equity = min(0.99, equity + self._opp_suboptimality_bonus())
             score, tier = self._classify(my_cards, community_cards)
             if tier == 'unknown':
                 tier = 'strong' if equity >= 0.70 else (
@@ -873,6 +933,8 @@ class Claude2Agent(Agent):
             f"call_thr={self._est_call_threshold():.2f} "
             f"fold_rate={fo:.2f} folds_often={self._opp_folds_often()} "
             f"raises_often={self._opp_raises_often()} "
+            f"sd_tight={self._opp_showdown_tight()} "
+            f"subopt={self._opp_suboptimality_bonus():.3f} "
             f"pressure={self._match_pressure():.2f} "
             f"hole={[PokerEnv.int_card_to_str(c) for c in my_cards]} "
             f"board={[PokerEnv.int_card_to_str(c) for c in community_cards]}"
@@ -894,7 +956,53 @@ class Claude2Agent(Agent):
                     f"| cum={self._cumulative_reward:+.0f} hands={self._hands_played}"
                 )
         if "player_0_cards" in info:
+            # Identify which player we are by matching our kept cards.
+            # At showdown, my_cards has exactly 2 non-(-1) ints (post-discard).
+            my_strs = {PokerEnv.int_card_to_str(c)
+                       for c in observation.get("my_cards", []) if c != -1}
+            p0_strs = set(info["player_0_cards"])
+            opp_kept_strs = (info["player_1_cards"] if my_strs == p0_strs
+                             else info["player_0_cards"])
+            board_strs    = info.get("community_cards", [])
+
             self.logger.info(
-                f"SHOWDOWN us={info.get('player_0_cards')} "
-                f"opp={info.get('player_1_cards')} board={info.get('community_cards')}"
+                f"SHOWDOWN us={sorted(my_strs)} opp={sorted(opp_kept_strs)} "
+                f"board={board_strs}"
             )
+
+            if len(opp_kept_strs) == 2 and len(board_strs) == 5:
+                try:
+                    opp_kept_t = [int_to_card(_CARD_STR_TO_INT[s]) for s in opp_kept_strs]
+                    board_t    = [int_to_card(_CARD_STR_TO_INT[s]) for s in board_strs]
+                    score = self.evaluator.evaluate(opp_kept_t, board_t)
+                    self._opp_showdown_scores.append(score)
+
+                    # Suboptimality check: did opp keep their best 2-card hand?
+                    # opp_discarded_cards in obs = the 3 cards they threw away.
+                    opp_disc_ints = [c for c in observation.get("opp_discarded_cards", [])
+                                     if c != -1]
+                    if len(opp_disc_ints) == 3:
+                        kept_ints  = [_CARD_STR_TO_INT[s] for s in opp_kept_strs]
+                        five_ints  = kept_ints + opp_disc_ints
+                        best_score = min(
+                            self.evaluator.evaluate(
+                                [int_to_card(five_ints[i]), int_to_card(five_ints[j])],
+                                board_t
+                            )
+                            for i, j in combinations(range(5), 2)
+                        )
+                        if best_score < score:
+                            # Opp kept a weaker hand than optimal. Our MC equity is
+                            # understated — record bonus proportional to score gap.
+                            bonus = min(0.06, (score - best_score) / 7462 * 0.8)
+                            self._opp_subopt_bonus_sum += bonus
+                        self._opp_subopt_count += 1
+
+                    self.logger.info(
+                        f"SD_LEARN opp_score={score} "
+                        f"avg={self._opp_avg_showdown_score():.0f} "
+                        f"tight={self._opp_showdown_tight()} "
+                        f"subopt_bonus={self._opp_suboptimality_bonus():.3f}"
+                    )
+                except (KeyError, Exception) as e:
+                    self.logger.warning(f"SHOWDOWN parse error: {e}")
