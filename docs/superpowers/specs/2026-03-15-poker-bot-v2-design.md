@@ -334,6 +334,146 @@ A bet of 0.65x pot must be able to represent either.
 
 All jitter applied via uniform random. No sizing tells, no exploitable clustering.
 
+## Counter-Intelligence Layer (integrated across modules)
+
+Opponents have access to match logs from games they played against us. With matches every
+5 minutes over 6 days, a single opponent could accumulate 50+ matches of data. An opponent
+running offline analysis (bet size clustering, discard deduction, threshold mapping) could
+reverse-engineer our strategy completely if we play deterministically.
+
+Every source of information leakage must be poisoned while keeping EV cost near zero.
+
+### Defense 1: Discard Stochasticity (equity.py)
+
+**Threat:** Our 3 discards are revealed. If `optimal_discard()` is deterministic, opponents
+can run the same math on our discards and deduce our exact hole cards.
+
+**Fix:** In `optimal_discard()`, after evaluating all 10 keeps, if the top-2 keeps are within
+0.03 equity of each other, select the #2 keep with 20% probability:
+
+```python
+def optimal_discard(hole_5, flop_3, opp_weights_fn=None):
+    keeps = []
+    for i, j in combinations(range(5), 2):
+        keep = (hole_5[i], hole_5[j])
+        eq = exact_equity(keep, flop_3, ...)
+        keeps.append((eq, i, j))
+    keeps.sort(reverse=True)
+
+    best_eq, bi, bj = keeps[0]
+    second_eq, si, sj = keeps[1]
+
+    # Stochastic mixer: if close, sometimes take #2 to hide information
+    if best_eq - second_eq < 0.03 and random.random() < 0.20:
+        return (si, sj)
+    return (bi, bj)
+```
+
+**EV cost:** <0.006 per hand on average (0.20 × 0.03 equity × rare occurrence). Negligible.
+**Information cost to opponent:** Cannot deduce our hole cards with certainty. Their
+reverse-engineering scripts produce multiple plausible holdings instead of one.
+
+### Defense 2: Per-Match Persona Rotation (match_manager.py)
+
+**Threat:** If we play identical parameters every match, opponents build accurate priors
+from past matches and counter us from hand 1.
+
+**Fix:** At `__init__()`, randomize key strategy parameters within defined ranges:
+
+```python
+# In match_manager or strategy __init__:
+self.persona = {
+    "value_raise_thr": random.uniform(0.58, 0.66),
+    "bluff_cap": random.uniform(0.25, 0.50),
+    "pf_call_margin": random.uniform(0.03, 0.07),
+    "probe_thr_base": random.uniform(0.40, 0.50),
+    "call_thr_margin": random.uniform(0.02, 0.05),
+    "bluff_size_center": random.uniform(0.55, 0.65),
+    "value_size_center": random.uniform(0.70, 0.80),
+}
+```
+
+Each match, the bot has a slightly different mathematical personality. An opponent analyzing
+5 matches will see 5 different raise rates, 5 different sizing profiles, and 5 different
+call thresholds. Their aggregate model will be noisy and unreliable.
+
+**EV cost:** Near zero — all parameter ranges are within the profitable zone. The variance
+in personality is smaller than the variance in card distribution.
+
+### Defense 3: Showdown Data Poisoning (strategy.py)
+
+**Threat:** Showdowns reveal ground truth about our range. If we only show down premium
+hands, opponents map our exact call/raise thresholds.
+
+**Fix:** With small probability (~3%), in LOW-STAKES unraised pots only, take a deliberately
+unusual line to reach showdown with an unexpected holding:
+
+```python
+# In strategy.decide(), after normal decision:
+if (pot <= 6 and not facing_raise and street == 3
+    and random.random() < 0.03):
+    # "Noise showdown" — check-call to showdown with weak hand
+    # Only in tiny pots where EV cost is minimal
+    return call() if can_call else check()
+```
+
+**Constraints:**
+- ONLY in pots <= 6 chips (pre-flop blind + check-check lines)
+- NEVER when facing a raise (don't donate chips)
+- ONLY on river (minimize additional streets of bleeding)
+- ~3% frequency = ~3 hands per 1000-hand match
+
+**EV cost:** ~3 hands × ~3 chips = ~9 chips per match worst case. Trivial.
+**Information cost to opponent:** Their Bayesian bluff_rate and call_floor estimates get
+polluted by data points showing us at showdown with bottom pair. Their model over-adjusts,
+making suboptimal counter-plays against our real range.
+
+### Defense 4: Board-Texture Sizing (strategy.py)
+
+**Threat:** If sizing correlates with hand strength (bigger = value, smaller = bluff),
+k-means clustering on 50+ matches will separate our ranges perfectly.
+
+**Fix:** Base bet sizing on BOARD TEXTURE, not hand strength. The same board produces
+the same sizing whether we have the nuts or air:
+
+```python
+def bet_size(pot, board, persona):
+    """Size based on board wetness, not hand strength."""
+    suits = [c // 9 for c in board]
+    ranks = sorted([c % 9 for c in board])
+
+    # Board wetness score: flush draws + straight draws + pairs
+    flush_score = max(Counter(suits).values()) / len(board)  # 0.4-1.0
+    connect_score = sum(1 for i in range(len(ranks)-1)
+                       if ranks[i+1] - ranks[i] <= 2) / max(1, len(ranks)-1)
+    wetness = (flush_score + connect_score) / 2  # 0.0 = dry, 1.0 = wet
+
+    # Wet boards → larger bets (more draws to charge / more bluff equity)
+    # Dry boards → smaller bets (less to protect against)
+    base = persona["bluff_size_center"] + wetness * 0.20
+    base = max(0.40, min(0.95, base))
+
+    # Jitter ±20% on top
+    return int(pot * base * (1.0 + random.uniform(-0.20, 0.20)))
+```
+
+**Result:** Our bet size is a function of the board, not our cards. An opponent's scatter
+plot of (bet_size vs hand_strength) shows zero correlation. Their clustering algorithm
+finds nothing because there is nothing to find.
+
+**EV impact:** Board-texture-based sizing is actually theoretically sound — GTO solvers
+size larger on wet boards and smaller on dry boards. This isn't a sacrifice; it's better
+poker AND better counter-intelligence.
+
+### Defense Summary
+
+| Defense | Where | EV Cost | Information Denied |
+|---------|-------|---------|--------------------|
+| Discard stochasticity | equity.py | <0.006/hand | Exact hole card deduction |
+| Persona rotation | match_manager.py | ~0 | Cross-match threshold mapping |
+| Showdown poisoning | strategy.py | ~9 chips/match | Range and call-floor estimation |
+| Board-texture sizing | strategy.py | ~0 (better poker) | Bet size ↔ hand strength correlation |
+
 ## Module 5: Match Manager (`match_manager.py`)
 
 Tracks match state and provides continuous (not discrete) phase signals.
