@@ -608,10 +608,14 @@ if street >= 2 and we_raised_earlier and not self._poison_active:
 # On EVERY subsequent decision in the same hand:
 if self._poison_active:
     if facing_raise:
-        return call()   # check-CALL even facing bets — forced showdown
+        raise_cost = opp_bet - my_bet
+        # ABORT CIRCUIT: if opponent bombs the pot, poison is too expensive
+        if raise_cost > pot * 0.40 or raise_cost > 15:
+            self._poison_active = False  # revert to standard strategy (will fold)
+        else:
+            return call()   # check-call small bets to force showdown
     else:
         return check()  # check down when not facing bet
-    # This overrides standard strategy for the rest of the hand
 
 # Reset at hand end:
 # In _reset_hand_state(): self._poison_active = False
@@ -620,7 +624,14 @@ if self._poison_active:
 **Why the flag is critical:** Without it, `check()` only works if the opponent also checks.
 If they bet (which they will in a raised pot), the poison hand hits standard strategy which
 folds equity < 0.30. The hand never reaches showdown. The data never gets poisoned. The flag
-forces check-call to showdown regardless of opponent action, guaranteeing data pollution.
+forces check-call to showdown — but ONLY against small bets.
+
+**Abort circuit:** If the opponent makes a large bet (>40% pot or >15 chips), the poison is
+too expensive — we abort by clearing the flag, and standard strategy takes over (which will
+naturally fold weak equity). This caps the maximum loss per poison attempt at ~15 chips while
+still reaching showdown against probes and block-bets, which are the most common action lines
+in checked-down pots. Opponents checking behind or making small block-bets on the river is
+extremely common — the bot will reach showdown often enough to pollute their logs at minimal cost.
 
 **Why Vector B is critical:** If poison only appears in passive/unraised pots, an opponent's
 `analyze_logs.py` simply filters: `if no_raise_in_hand: continue`. This isolates ALL poison
@@ -636,9 +647,10 @@ use to calibrate our raise ranges. This is irreparably corrupting.
 - Both vectors scale inversely with pot size
 - Expected ~5-7 poison hands per 1000-hand match across all action lines
 
-**EV cost:** ~6 hands × weighted avg ~8 chips = ~48 chips per match worst case (higher than
-before because Vector B now actually reaches showdown via forced check-calls). Still small
-compared to 100-500+ chips lost from being correctly read.
+**EV cost:** ~6 hands × weighted avg ~5 chips = ~30 chips per match. The abort circuit caps
+Vector B losses at ~15 chips per attempt (aborts if opponent bets big), and most poison hands
+will cost 0-5 chips (opponent checks behind or makes small probes). Negligible compared to
+100-500+ chips lost from being correctly read.
 
 **Why this is unfilterable:** Poison appears in passive pots AND raised pots, across all
 pot sizes. An opponent cannot filter by pot size, cannot filter by "raised vs unraised,"
@@ -704,10 +716,10 @@ poker AND better counter-intelligence.
 |---------|-------|---------|--------------------|
 | Discard stochasticity | equity.py | <0.006/hand | Exact hole card deduction |
 | Persona rotation | match_manager.py | ~0 | Cross-match threshold mapping |
-| Showdown poisoning (2 vectors + flag) | strategy.py | ~48 chips/match | Range, call-floor, AND raise-range estimation |
+| Showdown poisoning (2 vectors + abort) | strategy.py | ~30 chips/match | Range, call-floor, AND raise-range estimation |
 | Board-texture sizing | strategy.py | ~0 (better poker) | Bet size ↔ hand strength correlation |
 
-Total EV cost of all defenses: ~54 chips per 1000-hand match (~0.054 chips/hand).
+Total EV cost of all defenses: ~36 chips per 1000-hand match (~0.036 chips/hand).
 Negligible compared to the 100-500+ chips lost from being correctly read by opponents.
 
 ## Module 5: Match Manager (`match_manager.py`)
