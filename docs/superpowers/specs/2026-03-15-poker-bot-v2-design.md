@@ -139,7 +139,7 @@ def hand_rank(my_2: tuple, board_5: tuple) -> int:
     return HAND_RANKS[combo_index_7(sorted(my_2 + board_5))]
 
 def exact_equity(my_2, board, dead_cards, opp_discards=None,
-                 opp_weights_fn=None) -> float:
+                 my_discards=None, opp_weights_fn=None) -> float:
     """
     Exact equity via enumeration of RATIONAL opponent hands only.
 
@@ -154,6 +154,10 @@ def exact_equity(my_2, board, dead_cards, opp_discards=None,
         board: known community cards (3-5)
         dead_cards: known dead cards (our discards + opponent discards)
         opp_discards: opponent's 3 revealed discards (for rationality filter)
+        my_discards: our 3 discards (opponent sees these before choosing their keep —
+                     must be treated as dead cards in the rationality filter's keep
+                     evaluation, otherwise we assign weight to flush/straight draws
+                     the opponent would never keep because they saw us discard their outs)
         opp_weights_fn: function(opp_2_card_tuple) → float weight
 
     Returns: win probability [0.0, 1.0]
@@ -185,20 +189,22 @@ filter OUT the flush draw and produce catastrophically wrong equity.
 **Fix:** Evaluate each keep option's equity against the known flop using `exact_equity()`.
 This is called ONCE per hand (when building the filtered opponent range), not per-street:
 
+**Conceptual logic (DO NOT implement as nested Python loops):**
+
 ```python
-def rational_opponent_hands(remaining, opp_discards, flop):
+def rational_opponent_hands(remaining, opp_discards, flop, my_discards):
     """Yield only hands the opponent would rationally keep given the flop."""
+    # dead_for_opp_eval = flop + my_discards (opponent sees our discards before deciding)
+    dead_for_opp_eval = list(flop) + list(my_discards)
     for hand in combinations(remaining, 2):
-        # Reconstruct opponent's original 5-card deal
         original_5 = list(hand) + list(opp_discards)
-        # Evaluate all 10 keep options against ACTUAL FLOP
         best_eq = -1
         best_keep = None
         for i, j in combinations(range(5), 2):
             keep = (original_5[i], original_5[j])
             discard = [original_5[k] for k in range(5) if k not in (i, j)]
-            # Flop-aware equity: how strong is this keep ON THIS BOARD?
-            eq = exact_equity(keep, flop, discard)
+            # Flop-aware equity with MY discards as dead cards
+            eq = exact_equity(keep, flop, discard + dead_for_opp_eval)
             if eq > best_eq:
                 best_eq = eq
                 best_keep = set(keep)
@@ -206,40 +212,102 @@ def rational_opponent_hands(remaining, opp_discards, flop):
             yield hand
 ```
 
-**Cost analysis:** For each candidate hand (~120), evaluate 10 keeps. Each keep evaluation
-calls `exact_equity(keep, flop, discard)` which enumerates ~C(16,2)×C(14,2) = ~10,920
-lookups. Total: 120 × 10 × 10,920 = ~13M lookups. At numpy speed (~100M lookups/sec),
-this completes in ~130ms.
+**Critical: our discards are dead cards for the opponent's keep evaluation.** The opponent
+sees our 3 discards before choosing their keep. If we discarded 3 hearts, the opponent
+knows those hearts are dead — making heart flush draws weaker for them. Omitting our
+discards from the filter would assign weight to opponent flush/straight draws they would
+never actually keep because they saw us discard their outs.
 
-This is called ONCE per hand (after opponent discards are revealed, before any post-flop
-equity calls). The filtered set is cached and reused for all subsequent equity calls
-on flop/turn/river. The 130ms cost is a one-time per-hand overhead — still far faster
-than current MC sampling (multiple 50-200ms calls per hand).
+**MANDATORY: Vectorized implementation.** The above Python loops are for clarity only.
+Nested `for` loops in Python incur ~50-100ns overhead per iteration. 13M Python-level
+iterations would take 1-2 seconds, blowing past Phase 1's 0.5s/hand budget. The actual
+implementation MUST use NumPy vectorization:
 
-**Optimization:** If 130ms is too slow for Phase 1 (500s budget), use a two-tier filter:
-1. Fast pre-filter using hand_strength_2 (eliminate obviously irrational keeps) → ~50 candidates
-2. Precise flop-aware filter on the remaining 50 → 50 × 10 × 10,920 = ~5.5M lookups = ~55ms
+```python
+def rational_opponent_hands_vectorized(remaining, opp_discards, flop, my_discards):
+    """Vectorized rationality filter using batch table lookups."""
+    # 1. Pre-generate ALL candidate (hand, keep) combos as index arrays
+    remaining = np.array(remaining, dtype=np.int32)
+    opp_disc = np.array(opp_discards, dtype=np.int32)
+    dead = np.concatenate([np.array(flop), np.array(my_discards)])
+
+    # 2. All C(remaining, 2) candidate hands → shape (N, 2)
+    cand_hands = np.array(list(combinations(remaining, 2)), dtype=np.int32)  # ~120 rows
+
+    # 3. For each candidate hand, reconstruct original_5 = hand + opp_discards
+    #    All 10 keep options are fixed index pairs into the 5-card array
+    KEEP_INDICES = np.array(list(combinations(range(5), 2)), dtype=np.int32)  # (10, 2)
+
+    # 4. Build all original_5 arrays: shape (N, 5)
+    orig5 = np.concatenate([cand_hands, np.tile(opp_disc, (len(cand_hands), 1))], axis=1)
+
+    # 5. Extract all keeps: shape (N, 10, 2) and all discards: shape (N, 10, 3)
+    all_keeps = orig5[:, KEEP_INDICES]  # fancy indexing
+
+    # 6. For each (N×10) keep, compute exact_equity via BATCH table lookup
+    #    This is the inner hot loop — must be a single vectorized operation
+    #    Pre-build all 7-card combos (keep + board + remaining_cards),
+    #    index into HAND_RANKS table, compute win fractions via broadcasting
+    equities = batch_exact_equity(all_keeps, flop, dead)  # shape (N, 10)
+
+    # 7. Best keep per candidate = argmax along axis 1
+    best_keep_idx = np.argmax(equities, axis=1)  # shape (N,)
+
+    # 8. Filter: keep only candidates where their actual hand IS the best keep
+    #    Candidate hand = indices (0,1) in original_5 → keep_idx 0
+    mask = (best_keep_idx == 0)  # keep_indices[0] = (0, 1) = the candidate hand itself
+    return cand_hands[mask]
+```
+
+**`batch_exact_equity()`** is the critical function: it takes all (N×10) keeps, generates
+ALL opponent board completions as index arrays, does a single `HAND_RANKS[indices]` lookup
+(pure NumPy C-level), and computes win rates via vectorized comparison. Zero Python loops
+in the hot path.
+
+**Realistic performance estimate (vectorized):**
+- Pre-generate index arrays: ~0.5ms (Python overhead, one-time)
+- Batch table lookups: 13M entries × ~10ns/lookup (NumPy vectorized) = ~130ms
+- Total: ~130-150ms per hand (one-time, cached)
+
+**Two-tier optimization for Phase 1 (500s budget, 0.5s/hand):**
+1. Fast pre-filter: use `hand_strength_2` to eliminate keeps that are obviously worse than
+   the best keep by >0.15 equity → reduces candidates from ~120 to ~50
+2. Vectorized flop-aware filter on remaining ~50 → ~5.5M lookups = ~55-70ms
+
+**Fallback:** If even vectorized is too slow, pre-filter aggressively (keep only top-3
+keeps per candidate by hand_strength_2) → 120 × 3 × 10,920 = ~3.9M lookups = ~40ms.
+Accuracy cost is minimal — the pre-filter only discards keeps that are bad on average
+AND bad on this specific flop.
 
 **Impact:** Correctly handles flush draws, straight draws, and situational keeps that
 pre-flop averages would miss. Typically filters from ~120 candidates down to ~30-50
 consistent hands, with the RIGHT hands surviving (flush draws on flush boards, pairs
 on dry boards).
 
-### Performance
+### Performance (vectorized NumPy — realistic estimates)
 
-| Operation | Lookups | Time |
+**Critical:** All time estimates assume vectorized NumPy operations (batch array indexing,
+broadcasting). Pure Python for-loop implementations would be 10-20x slower and are NOT
+acceptable. Every equity computation must hit the `HAND_RANKS` table via NumPy fancy
+indexing, not Python iteration.
+
+| Operation | Lookups | Time (vectorized) |
 |-----------|---------|------|
-| River equity (5 board) | ~50-80 (filtered) | <0.1ms |
-| Turn equity (4 board) | ~700-1,000 (filtered) | <0.3ms |
-| Flop equity (3 board) | ~5,000-8,000 (filtered) | <1.5ms |
-| Optimal discard (10 × flop equity) | ~50,000-80,000 | <10ms |
+| River equity (5 board) | ~50-80 (filtered) | <0.5ms |
+| Turn equity (4 board) | ~700-1,000 (filtered) | <2ms |
+| Flop equity (3 board) | ~5,000-8,000 (filtered) | <5ms |
+| Optimal discard (10 × flop equity) | ~50,000-80,000 | <30ms |
 | Pre-flop strength | 1 | <0.01ms |
-| Rationality filter overhead | ~1,200 per call | <0.05ms |
-| **Total worst case per hand** | | **<15ms** |
+| Rationality filter (vectorized, one-time) | ~5.5M-13M | ~55-150ms |
+| **Total worst case per hand** | | **<200ms** |
 
-Compared to current MC: 50-200ms per call, multiple calls per hand, noisy. New engine is
-10-100x faster AND exact. The rationality filter actually reduces total work by eliminating
-impossible opponent hands from equity enumeration.
+Phase 1 budget: 500s / 1000 hands = 500ms/hand. At ~200ms worst case, we use ~40% of
+budget with comfortable margin. Phase 2/3 have 2-3x more time.
+
+Compared to current MC: 50-200ms per call, multiple calls per hand, noisy. New engine
+is comparable speed but EXACT — no variance, no re-rolling. The rationality filter is
+a one-time cost that actually reduces subsequent equity calls by eliminating impossible
+opponent hands.
 
 ## Module 3: Opponent Model (`opponent.py`)
 
@@ -348,8 +416,41 @@ Example: pot=20, raise_cost=10, fold_rate=0.50, equity=0.25.
 - With equity=0.10: (0.50 × 20) + (0.50 × (0.10 × 40 - 10)) = 10 + (-3) = +7.0
 - The full formula captures semi-bluff value that the naive formula misses entirely.
 
-If `bluff_ev > 0`, raising is +EV. Bluff probability proportional to profitability, capped at
-persona["bluff_cap"] for balance. Minimum equity: 0.10 (flop/turn), 0.20 (river).
+**GTO-anchored bluff frequency (anti-adaptation safeguard):**
+
+Pure exploitative bluffing (`if bluff_ev > 0: bluff`) is vulnerable to responsive opponents.
+If they notice we're over-bluffing, their fold_rate drops to near zero. Our Bayesian fold_rate
+estimate lags by 10-20 hands, during which we hemorrhage chips bluffing into a calling station.
+
+The fix is a GTO bluff ceiling derived from our bet sizing. When betting `b` into pot `p`,
+the opponent needs equity `b / (p + 2b)` to call. To make them indifferent, our bluff frequency
+should not exceed `b / (p + b)` of our total betting range (MDF-derived bluff ratio):
+
+```python
+bet_frac = raise_cost / max(1, pot)
+gto_bluff_ratio = bet_frac / (1.0 + bet_frac)  # e.g., 0.75x pot → 43% bluffs
+```
+
+The actual bluff probability is the MINIMUM of the exploitative and GTO ceilings:
+
+```python
+exploit_bluff_prob = min(1.0, bluff_ev / max(1, pot)) * persona["bluff_cap"]
+gto_bluff_ceiling = gto_bluff_ratio  # from sizing math above
+
+# Blend: lean exploitative when confidence is high, lean GTO when uncertain
+confidence = min(1.0, fold_observations / 30)  # 0-1 based on data quality
+bluff_prob = exploit_bluff_prob * confidence + gto_bluff_ceiling * (1 - confidence)
+bluff_prob = min(bluff_prob, gto_bluff_ceiling * 1.3)  # never exceed GTO by >30%
+```
+
+This ensures:
+- With few observations (hands 0-30): bluff frequency is near-GTO balanced
+- With many observations (hands 30+): we can deviate up to 30% above GTO to exploit folders
+- Against an opponent who adapts and stops folding: our bluff frequency naturally drops
+  because (a) fold_rate decreases → bluff_ev drops, and (b) GTO ceiling caps us regardless
+- We NEVER bluff at a rate that makes calling always profitable for the opponent
+
+Minimum equity: 0.10 (flop/turn), 0.20 (river).
 
 **Critical:** There is ONE sizing function (`bet_size`), used for BOTH bluffs and value.
 It outputs the same size for the same board regardless of hand strength. No separate
@@ -372,7 +473,7 @@ When checked to us: probe threshold 0.45 base, drops to 0.20 vs folders. Through
 
 **Raise war cap:** If opponent re-raises our raise, require equity 0.65+ to continue (0.55 vs high bluff rate opponents).
 
-### Raise sizing (unified, board-texture-based)
+### Raise sizing (unified, board-texture-based, range-balanced)
 
 There is ONE sizing function used for ALL raises (value, bluff, probe). Sizing is
 determined by board texture and per-match persona, NOT by hand strength. See Defense 4
@@ -384,6 +485,23 @@ Key properties:
 - Per-match persona shifts the center ±0.10x, preventing cross-match clustering
 - ±20% jitter on top of everything
 - Zero correlation between bet size and hand strength → immune to clustering attacks
+
+**Range balance enforcement:** Board-texture sizing alone is insufficient if the FREQUENCY
+of betting varies wildly between value and air across board types. If an opponent logs
+"on wet boards, bot bets 0.95x pot — and 80% of the time it's a bluff," the sizing mask
+is broken. Sizing dictates the required value-to-bluff ratio:
+
+```python
+# After bet_size() determines the raise amount:
+bet_frac = raise_amount / max(1, pot)
+gto_value_ratio = 1.0 - bet_frac / (1.0 + bet_frac)  # e.g., 0.75x → 57% value
+```
+
+The strategy module tracks its own betting frequency per board-texture class (wet/medium/dry)
+and enforces that the bluff-to-value ratio stays within ±15% of the GTO ratio. If we've
+been bluffing too much on wet boards, the next bluff opportunity on a wet board is suppressed
+even if exploitatively +EV. This prevents opponents from profiling our range composition
+per board type.
 
 ## Counter-Intelligence Layer (integrated across modules)
 
@@ -571,7 +689,7 @@ phase_mult: int           # 1 (500s), 2 (1000s), or 3 (1500s)
 - **aggression** [0, 1]: Early game factor. `max(0, 1 - hand/300) × (1 + uniform(-0.20, 0.20))`. High early, decays smoothly. Suppressed in protection mode. Combined with desperation: `max(early_factor, max(0, pressure) × 0.8)`.
 - **in_protection** [bool]: Lead > 15% of remaining bleed → minimize variance.
 - **in_lockout** [bool]: Lead > remaining_hands × 1.5 + buffer → auto-fold everything.
-- **time_per_hand** [float]: Adaptive. With exact equity taking <20ms/hand, time is no longer a constraint. But still tracked for safety.
+- **time_per_hand** [float]: Adaptive. With vectorized exact equity taking ~200ms/hand worst case (500ms budget in Phase 1), time must be actively monitored. The rationality filter is the biggest cost; if running behind, switch to the two-tier pre-filter optimization.
 
 All transitions are smooth and jittered. No hard phase boundaries detectable by opponents.
 
@@ -587,7 +705,7 @@ Thin wiring layer. Inherits from `Agent`, implements `act()` and `observe()`.
 3. If DISCARD required (street 1, first action):
      equity.optimal_discard(hole_5, flop_3, opponent.opp_weights_fn) → keep indices
 4. If BETTING:
-     eq = equity.exact_equity(my_2, board, dead_cards, opponent.opp_weights_fn)
+     eq = equity.exact_equity(my_2, board, dead_cards, opp_discards, my_discards, opponent.opp_weights_fn)
      opp_ctx = opponent.get_context(street)
      match_state = match_manager.get_state()
      action = strategy.decide(eq, pot_odds, street, ..., opp_ctx, match_state, obs)
