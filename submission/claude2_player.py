@@ -1,20 +1,22 @@
 """
-Claude2Agent v6 — Adaptive Value Bot
+Claude2Agent v37 — Adaptive Exploitative Bot
 
 Strategy principles (no opponent-specific hardcoding):
   1. HAND TIERS: SF/FH/Flush = monster, Trips/Straight = strong,
      Two-pair/Top-pair = medium, rest = weak.
-     (Flush correctly classified as ≤1599 treys score, not ≤322)
-  2. VALUE BETTING: Equity-driven sizing. Bigger bets with higher equity
-     to extract maximum from opponent's calling range.
-  3. ADAPTIVE CALL THRESHOLD: Bayesian estimate from observed bet/response
-     history. Tracks opponent's call threshold dynamically.
-  4. OPPONENT BLUFF RATE: Learned from action counts. Used to tune
-     facing-bet decisions (more bluff-catching when opp is loose-aggressive).
-  5. RIVER DISCIPLINE: No bluffing on river (low success rate heads-up).
-     Tighter calls on river (less bluff-catching needed vs passive lines).
-  6. PROBE SIZING: Always probe above the Bayesian-estimated call threshold
-     so probes have positive fold equity.
+  2. VALUE BETTING: Equity-driven sizing with early-game aggression multiplier.
+     Bigger bets vs calling stations; larger pots early when variance is cheap.
+  3. ADAPTIVE CALL THRESHOLD: Bayesian estimate + context-aware aggr_call_floor.
+     Adjusts for opponent raise frequency, bet sizing, action line (trap/barrel),
+     discard pattern (flush chaser / pair keeper), and showdown hand distribution.
+  4. OPPONENT MODELING: Tracks raise rate, bet sizes, per-hand action sequences,
+     discard patterns across hands, and showdown hand type distribution.
+  5. EARLY GAME AGGRESSION: Smooth decay curve (hands 0→300), call/bet wider
+     early; protection mode (lead > 10% of remaining bleed) tightens to lock win.
+  6. PROBABILISTIC THRESHOLDS: Sigmoid gray zones on all key decisions to prevent
+     exploitation of hard cutoffs.
+  7. PROBE SIZING: Above Bayesian-estimated call threshold; suppressed vs
+     hyper-aggressive opponents (raises_often) and in protection mode.
 """
 
 import math
@@ -653,8 +655,9 @@ class Claude2Agent(Agent):
         # raises_often: their range is too wide → drop threshold directly
         if raises_often:
             aggr_call_floor -= 0.06
-        # Early game / desperation: call wider when variance is acceptable
-        aggr_call_floor -= aggression * 0.05
+        # Early game only: call wider before hand 300. Desperation does NOT lower this —
+        # calling lighter when losing vs value-betting opponents builds bigger pots we lose.
+        aggr_call_floor -= early_factor * 0.05
         aggr_call_floor = max(0.28, aggr_call_floor)  # hard floor
 
         # Context-aware aggr_call_floor adjustments (only when facing a real bet)
@@ -792,8 +795,9 @@ class Claude2Agent(Agent):
         # In 27-card deck, flushes are common → 0.80+ is the true "strong" bar.
         # Bet selectively; don't inflate pots with marginal leads.
         # ============================================================
-        # Early game: bet bigger to build larger pots when variance is acceptable.
-        early_bet_mult = 1.0 + aggression * 0.20  # up to 1.20x early, 1.0x after hand 300
+        # Early game only: bet bigger before hand 300 to build leads.
+        # Desperation does NOT increase bet sizing — bigger bets when losing = bigger pot losses.
+        early_bet_mult = 1.0 + early_factor * 0.20  # up to 1.20x early, 1.0x after hand 300
 
         if not facing:
             if self._soft_thr(equity, 0.83 - aggression * 0.02, 0.02):
@@ -993,7 +997,7 @@ class Claude2Agent(Agent):
 
         # Rule 5: Marginal equity at cheap price.
         # FIXED: pot_odds limit extended from 0.25 to 0.30 base, scales with rr.
-        rule5_po_limit = min(0.35, 0.25 + max(0.0, (rr - 0.40) * 0.25) + aggression * 0.05)
+        rule5_po_limit = min(0.35, 0.25 + max(0.0, (rr - 0.40) * 0.25) + early_factor * 0.05)
         if equity >= max(pot_odds + 0.04, 0.40) and pot_odds <= rule5_po_limit and can_call:
             return call()
 
