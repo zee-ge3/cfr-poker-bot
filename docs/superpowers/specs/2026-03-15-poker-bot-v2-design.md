@@ -370,15 +370,112 @@ For each 5-card hand, sample 200 random flops, find optimal discard for each, av
 
 **Note:** This table uses sampling (200 flops), so pre-flop decisions carry ~3-5% noise. Only post-flop decisions (with known board cards) are truly exact. This is acceptable because pre-flop decisions are lower-stakes (1-2 chip blinds) and the noise is far smaller than MC sampling (~10-15% noise). If needed, can increase to 500+ samples or compute exactly in later iterations.
 
+## Cross-Match Learning & Refinement
+
+The bot improves between submissions via offline log analysis and tunable parameters.
+
+### Tunable parameters (`tables/strategy_params.json`)
+
+All strategy thresholds load from a config file rather than being hardcoded:
+
+```json
+{
+  "pf_call_margin": 0.05,
+  "call_thr_base_margin": 0.03,
+  "bluff_cap": 0.40,
+  "bluff_min_equity_flop": 0.10,
+  "bluff_min_equity_river": 0.20,
+  "value_raise_thr": 0.62,
+  "probe_thr_base": 0.45,
+  "probe_thr_vs_folder": 0.20,
+  "reraise_thr": 0.65,
+  "protection_equity_min": 0.60,
+  "bluff_prior_alpha": 2,
+  "bluff_prior_beta": 8,
+  "early_aggression_decay": 300
+}
+```
+
+After each tournament round, log analysis identifies which thresholds cost chips → update params → resubmit.
+
+### Opponent priors (`tables/opponent_priors.json`)
+
+Pre-loaded profiles for known opponents. Gives 10-20 hand calibration head start:
+
+```json
+{
+  "AlbertLuoLovers": {
+    "pf_raise_rate": 0.37,
+    "pf_raise_size": 20,
+    "bluff_prior": [4, 6],
+    "fold_rate_postflop": 0.12,
+    "pref_suited": 1.3,
+    "updated_match_id": 5633
+  }
+}
+```
+
+At match start, check opponent name from observation/info. If prior exists, initialize opponent model with those weights instead of neutral defaults.
+
+**Critical: opponent evolution handling.** Opponents also refine their bots between matches. Stale priors are dangerous. Two safeguards:
+
+1. **Confidence decay:** Prior data weighted by recency. Each prior carries `updated_match_id`. Older priors decay: weight = `0.8 ^ (matches_since_update)`. After ~5 matches without update, prior weight is negligible.
+
+2. **Drift detection:** If observed behavior diverges significantly from prior within the first 15-30 hands, reset to neutral:
+   ```python
+   if abs(observed_rate - prior_rate) > 0.25 and hands_observed > 15:
+       self.prior_weight = 0.0  # opponent changed, discard stale prior
+   ```
+   This ensures priors help when opponents are stable but never lock us into a wrong read.
+
+3. **Priors are soft, not hard:** Prior values blend with observations via exponential moving average, not replace them. By hand 50, observations dominate regardless of prior.
+
+### Offline analysis script (`analyze_logs.py`, NOT shipped)
+
+Processes tournament game logs and outputs:
+
+1. **Threshold calibration:** Identify folds where equity > call threshold → quantify chips left on table → suggest threshold adjustments.
+2. **Bluff efficiency:** Track bluff raise success rate → adjust bluff_cap and min_equity params.
+3. **Opponent scouting:** Build/update `opponent_priors.json` from observed tendencies.
+4. **Discard quality audit:** Compare our discards against optimal → flag systematic errors.
+5. **Strategy regression detection:** Compare current EV/hand against previous versions.
+
+### Refinement cycle
+
+```
+Tournament round N:
+  1. Matches play out → logs collected
+  2. analyze_logs.py processes results
+  3. Update strategy_params.json (threshold tuning)
+  4. Update opponent_priors.json (scouting, with recency decay)
+  5. Optionally: refine hand_potential_5.npy with more samples
+  6. Resubmit → tournament round N+1
+```
+
 ## Testing Strategy
 
+### Unit tests
 1. **Table verification:** Generate tables, spot-check against WrappedEval for random hands.
 2. **Equity accuracy:** Compare exact_equity output against high-sample MC for 100 random situations. Must match within 0.001.
 3. **Discard optimality:** For 100 random (5-card, flop) situations, verify optimal_discard matches exhaustive MC search.
-4. **Strategy smoke test:** Run against current PA v18r and C2 v37 in local simulation. Must not lose by more than historical baselines.
+
+### Integration tests
+4. **Lock-in test:** Verify auto-fold activates at correct lead thresholds and match completes without timeout.
 5. **Exploit verification:** Against a "raise every flop" opponent, verify fold-to-raise rate < 40% (was 80%+ before).
 6. **Balance verification:** Against a "fold everything" opponent, verify raise frequency increases proportionally.
-7. **Lock-in test:** Verify auto-fold activates at correct lead thresholds and match completes without timeout.
+
+### Local round-robin simulation
+7. **Round-robin vs PA v18r and C2 v37:** Run the new bot against both existing bots using the local match runner. Minimum 10 matches per pairing (10,000 hands each). Measure:
+   - EV/hand (must be positive against both)
+   - Post-flop fold-to-raise rate (must be < 50% against aggressive opponents)
+   - Bluff raise frequency (must increase proportionally with opponent fold rate)
+   - Showdown win rate (must be > 50%)
+   - Time per hand (must average < 50ms with headroom for phase 1's 500s budget)
+8. **Regression check:** New bot must not lose to either PA or C2 by more than their historical loss margins against tournament opponents.
+
+### Pre-submit validation
+9. **Full 1000-hand match timing:** Verify total time < 400s (Phase 1), < 800s (Phase 2), < 1200s (Phase 3) with margin.
+10. **Submission packaging:** Verify `from submission.player import PlayerAgent` works, all tables load correctly, no missing imports.
 
 ## Implementation Priority
 
@@ -388,14 +485,15 @@ For each 5-card hand, sample 200 random flops, find optimal discard for each, av
 4. `opponent.py` → opponent model with range weighting
 5. `strategy.py` → adaptive strategy with bluff-rate-adjusted calls + EV bluff raises
 6. `player.py` → wire everything together
-7. Integration testing → local simulation vs PA/C2
-8. Submit → iterate based on tournament results
+7. Local round-robin testing vs PA v18r and C2 v37
+8. Submit → analyze logs → refine params → resubmit
 
 ## Risk Mitigation
 
-- **WrappedEval partition assumption:** Must verify that evaluate(hand, board) gives same result regardless of 2+5 split of 7 cards. If not, table design needs revision.
+- **WrappedEval partition assumption:** Verified — evaluate(hand, board) gives same result regardless of 2+5 split.
 - **Table generation time:** hand_potential_5.npy takes hours. Can ship v1 without it (use hand_strength_2 for pre-flop) and add it in v2.
-- **New bugs in fresh code:** Mitigated by modular design (each module testable independently) and integration tests against known opponents.
+- **New bugs in fresh code:** Mitigated by modular design (each module testable independently), local round-robin testing against PA/C2, and integration tests.
+- **Stale opponent priors:** Handled by confidence decay and drift detection. Priors help but never override live observations.
 - **Numpy dependency:** All table operations use numpy which is pre-installed. No external dependency risk.
 - **ARM64 portability:** Tournament runs on AWS Graviton2 (ARM64). Numpy `.npy` files use platform-independent format with explicit endianness — tables generated on x86 are fully portable.
 - **Pre-flop noise:** `hand_potential_5.npy` uses 200-sample estimation, introducing ~3-5% noise in pre-flop decisions. Acceptable for low-stakes pre-flop bets (1-2 chips). Can increase samples or compute exactly in later versions.
