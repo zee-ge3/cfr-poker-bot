@@ -130,6 +130,18 @@ class Claude2Agent(Agent):
             return 0.10
         return 0.05  # conservative: assume mostly value
 
+    def _opp_raises_often(self) -> bool:
+        """True when opponent raises a very high fraction of their actions.
+
+        Indicates hyper-aggressive 'raise-everything' style. When True:
+          - Widen preflop call range (their range is too wide to justify folding)
+          - Suppress thin probes (their reraise inflates the pot vs our medium hands)
+        """
+        total = self._opp_action_total()
+        if total < 10:
+            return False
+        return (self._opp_raise_count / total) > 0.48
+
     def _opp_folds_often(self) -> bool:
         """True when opponent folds a high fraction of the time when facing a bet.
 
@@ -201,17 +213,20 @@ class Claude2Agent(Agent):
     def _n_samples(self, base: int) -> int:
         """Scale MC samples to available time budget.
 
-        phase_mult=1: Phase 1 (≤600s) — use base counts.
-        phase_mult=2: Tournament Phase 2 (600–1100s budget) — scale 1.5x.
-        phase_mult=3: Simulation (9999s) — use base counts (sim speed matters).
+        phase_mult=1: Phase 1 (500s)  — base counts.
+        phase_mult=2: Phase 2 (1000s) — 1.5x samples (more accurate equity).
+        phase_mult=3: Phase 3 (1500s) — 2.5x samples (best accuracy).
+        phase_mult=9: Simulation (9999s) — base counts (sim speed matters).
         Emergency taper applies when time critically low.
         """
         t = self._time_left
         if t < 60:  return max(5,  base // 8)
         if t < 150: return max(10, base // 4)
         if t < 250: return max(20, base // 2)
-        if self._phase_mult == 2:  # Tournament Phase 2 (1000s budget)
-            return min(int(base * 1.5), 80)
+        if self._phase_mult == 3:  # Phase 3 (1500s) — 4 vCPU, use full accuracy
+            return min(int(base * 2.5), 150)
+        if self._phase_mult == 2:  # Phase 2 (1000s) — 2 vCPU
+            return min(int(base * 1.5), 100)
         return base
 
     # ------------------------------------------------------------------ #
@@ -450,9 +465,16 @@ class Claude2Agent(Agent):
         facing   = cost > 0
         pot_odds = cost / (cost + pot) if cost > 0 else 0.0
 
-        folds_often = self._opp_folds_often()
-        rr          = self._opp_aggression()
+        folds_often  = self._opp_folds_often()
+        raises_often = self._opp_raises_often()
+        rr           = self._opp_aggression()
+
+        # Protection mode: when comfortably ahead, minimise variance over EV.
+        # Goal is to WIN the match (binary), not maximise chips.
+        # Accept ~1.5 chip/hand blind bleed; refuse marginal pots that could swing.
+        # Threshold: lead > 15% of expected remaining bleed → protect the win.
         pressure    = self._match_pressure()   # +1=desperate, -1=comfortable lead
+        in_protection = (pressure < -0.10)
 
         # Continuous fold rate for probe sizing (0.0-1.0)
         real = self._bet_outcomes[2:]
@@ -508,6 +530,19 @@ class Claude2Agent(Agent):
             # A real raise means someone put in extra beyond the initial blinds: cost > 1.
             pf_real_raise = (cost > 1)
 
+            # Protection mode: fold weak hands preflop; accept 1-2 chip blind cost
+            # instead of risking post-flop variance. Only play solid holdings.
+            if in_protection:
+                pf_call_thr = max(pf_call_thr, 0.60)
+
+            # vs hyper-aggro: their preflop range is too wide to fold against.
+            # At pot_odds=0.42 (raise to 8 chips), eq=0.47: EV(call)=+0.05P > 0.
+            # vs normal: tight calling (0.28) accounts for value-heavy 3-bet range.
+            def pf_should_call(equity, pot_odds):
+                if raises_often:
+                    return equity >= pot_odds + 0.03 and equity >= pf_call_thr
+                return pot_odds <= 0.28
+
             if equity >= pf_raise_thr:
                 # In deep preflop escalation (already large pot), don't reraise
                 # unless very strong — 0.68 equity is a dog against a 3/4-bet range.
@@ -522,16 +557,14 @@ class Claude2Agent(Agent):
                 return call() if can_call else check()
             elif equity >= pf_open_thr:
                 if pf_real_raise:
-                    # Conservative: MC equity vs random underestimates 3-bet range advantage.
-                    # Tight calling range (0.28) implicitly accounts for range-vs-range.
-                    if pot_odds > 0.28:
+                    if not pf_should_call(equity, pot_odds):
                         return fold() if can_fold else check()
                     return call() if can_call else fold()
                 # Never open-raise with medium hands: actual MC equity is 0.18-0.25,
                 # building a larger pot against a calling station is –EV.
                 return check() if can_check else call()
             elif equity >= pf_call_thr:
-                if pf_real_raise and pot_odds > 0.28:
+                if pf_real_raise and not pf_should_call(equity, pot_odds):
                     return fold() if can_fold else check()
                 return call() if can_call else check()
             else:
@@ -567,9 +600,11 @@ class Claude2Agent(Agent):
                     return self._bet(obs, frac, "VALUE-LARGE")
                 return check() if can_check else call()
 
-            elif equity >= 0.63:
+            elif equity >= 0.63 and not in_protection:
                 # Strong: standard value bet (low FH qualifies; flush/trips do not).
                 # Calibrated for best-2-from-5 MC: low FH ≈ 0.69, flush ≈ 0.51.
+                # Protection mode: check instead — let opp bet at their size;
+                # we call at better pot_odds than we'd face after a raise on our bet.
                 if street < 3:
                     frac = 0.55 if folds_often else 0.80  # stations call → extract max on flop/turn
                 else:
@@ -582,6 +617,9 @@ class Claude2Agent(Agent):
                 # Probe: only when equity clears aggr_call_floor (enough to call a re-raise).
                 # +0.03 extra vs stations (thin value is still +EV: ~0.04P gain per probe at 0.54 eq).
                 # Size: fold-equity play vs folders (small to induce calls), value play vs stations (bigger).
+                # Protection/hyper-aggro: skip probe — check and let them define the price.
+                if in_protection or raises_often:
+                    return check() if can_check else fold()
                 if folds_often:
                     frac = max(0.24, min(0.40, 0.24 + fold_rate * 0.20))
                 else:
@@ -593,7 +631,7 @@ class Claude2Agent(Agent):
                     return self._bet(obs, frac, "PROBE")
                 return check() if can_check else fold()
 
-            elif street in (1, 2) and can_raise and folds_often:
+            elif street in (1, 2) and can_raise and folds_often and not in_protection:
                 # Semi-bluff/steal: flop or turn, confirmed folders only.
                 # EV(bet B) - EV(check) = fold_rate*(1-eq)*P + (1-fold_rate)*(2*eq-1)*B
                 # At fold_rate=0.55, B=0.30P: break-even eq=1.48 — ALWAYS profitable vs folder.
@@ -613,19 +651,17 @@ class Claude2Agent(Agent):
                 # EV gain at any eq > 1/3 vs station is positive:
                 # At eq=0.50, fold_rate=0 (never folds): EV gain = B*(3*0.50-1) = +0.175P.
                 # Build value pots against calling stations; flop less aggressive (2 streets ahead).
-                freq = 0.70 if street == 2 else 0.35
-                if random.random() < freq:
-                    frac = max(0.28, min(0.45, 0.28 + equity * 0.25))
-                    return self._bet(obs, frac, "PROBE-STN-THIN")
+                # vs hyper-aggro: skip — their reraise with medium hands blows up the pot -EV.
+                if not raises_often:
+                    freq = 0.70 if street == 2 else 0.35
+                    if random.random() < freq:
+                        frac = max(0.28, min(0.45, 0.28 + equity * 0.25))
+                        return self._bet(obs, frac, "PROBE-STN-THIN")
                 return check() if can_check else fold()
 
-            elif street == 3 and can_raise:
+            elif street == 3 and can_raise and not in_protection:
                 # Thin river value bet: trips/flush (equity ~0.48-0.63).
-                # Math: vs station, EV(bet) = 0.55P + 0.10B > EV(check) = 0.55P always.
-                # vs folders: EV(bet) ≈ 0.80P > EV(check) ≈ 0.57P even with 55% fold rate.
-                # OOP vs folder: bet forces them to call/fold at our price; check lets them
-                # bet at their price and we face higher pot_odds. Betting OOP is still +EV.
-                # IP 45%, OOP 30% (slightly discounted for positional disadvantage on action).
+                # Protection mode: skip all thin river bets; check and evaluate their bet.
                 if folds_often and 0.48 <= equity < 0.63:
                     # High frequency: EV gain ≈ +0.30P per bet vs confirmed folder.
                     # Fold equity + positive showdown EV both justify near-always betting.
@@ -672,6 +708,13 @@ class Claude2Agent(Agent):
                 rr_frac = 1.20 if not folds_often else 0.90
                 return self._bet(obs, rr_frac, "RERAISE")
             return call() if can_call else fold()
+
+        # Protection mode: below near-lock, only call at a very good price.
+        # Refuse marginal pots — a fold costs 0, a bad call costs 50+.
+        if in_protection and equity < reraise_thr:
+            if equity >= 0.50 and pot_odds <= 0.28 and can_call:
+                return call()
+            return fold() if can_fold else check()
 
         # Rule 2: Strong hand → reraise or call
         if equity >= reraise_fold_thr:
@@ -758,8 +801,14 @@ class Claude2Agent(Agent):
         self._time_left = float(observation.get("time_left", 500.0))
 
         # Detect compute phase from initial time budget (set once, never changed)
+        # 9999 = simulation mode (keep base sample counts for speed)
         if self._phase_mult == 1 and self._time_left > 600:
-            self._phase_mult = 3 if self._time_left > 1100 else 2
+            if self._time_left > 5000:
+                self._phase_mult = 9   # simulation / dev — base counts
+            elif self._time_left > 1100:
+                self._phase_mult = 3   # Phase 3 (1500s) — 2.5x samples
+            else:
+                self._phase_mult = 2   # Phase 2 (1000s) — 1.5x samples
             self.logger.info(f"Phase detected: time_left={self._time_left:.0f} → phase_mult={self._phase_mult}")
 
         my_cards        = [c for c in observation["my_cards"] if c != -1]
@@ -823,6 +872,8 @@ class Claude2Agent(Agent):
             f"eq={equity:.3f} tier={tier} "
             f"call_thr={self._est_call_threshold():.2f} "
             f"fold_rate={fo:.2f} folds_often={self._opp_folds_often()} "
+            f"raises_often={self._opp_raises_often()} "
+            f"pressure={self._match_pressure():.2f} "
             f"hole={[PokerEnv.int_card_to_str(c) for c in my_cards]} "
             f"board={[PokerEnv.int_card_to_str(c) for c in community_cards]}"
         )
