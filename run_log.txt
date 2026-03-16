@@ -1,0 +1,28 @@
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+
+============================================================
+  Discovered 2 bots: ['Claude2Agent', 'PlayerAgent']
+  1 matchups per round  |  1000 hands/match
+============================================================
+
+  Match    1: Claude2Agent vs PlayerAgent  (1000 hands)
+2026-03-15 11:48:16,595 - Claude2Agent - INFO - Starting agent server on 0.0.0.0:9500
+2026-03-15 11:48:16,595 - Claude2Agent - INFO - Starting agent server on 0.0.0.0:9500
+2026-03-15 11:48:16,599 - PlayerAgent - INFO - Starting agent server on 0.0.0.0:9501
+2026-03-15 11:48:16,599 - PlayerAgent - INFO - Starting agent server on 0.0.0.0:9501
+INFO:     Started server process [757971]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+ERROR:    [Errno 98] error while attempting to bind on address ('0.0.0.0', 9500): address already in use
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Started server process [757972]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+ERROR:    [Errno 98] error while attempting to bind on address ('0.0.0.0', 9501): address already in use
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+2026-03-15 11:48:17,328 - runner - INFO - Hand number: 0, Claude2Agent bankroll: -2, PlayerAgent bankroll: 2
