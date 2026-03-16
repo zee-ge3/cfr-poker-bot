@@ -77,3 +77,40 @@ def test_fold_to_raise_detected():
         "Expected at least one non-fold response to raise"
     # Both should be on Flop street
     assert all(e['street'] == 'Flop' for e in ftr_events)
+
+
+def test_ftr_aggregation():
+    """FTR rate computed correctly from multiple hands."""
+    from opponent_profiler import aggregate_opponent
+
+    ftr_events = [
+        {'street': 'Flop', 'opp_is_ip': False, 'folded': True},
+        {'street': 'Flop', 'opp_is_ip': False, 'folded': True},
+        {'street': 'Flop', 'opp_is_ip': False, 'folded': False},
+        {'street': 'Turn', 'opp_is_ip': True,  'folded': False},
+    ]
+    match_data = {
+        'opp_name': 'TestBot',
+        'hands': [{'hand_num': i, 'opp_is_ip': False} for i in range(120)],
+        'opp_ftr_events': ftr_events,
+        'rows': [],
+        'opp_slot': 0,
+        'geoz_slot': 1,
+    }
+    profile = aggregate_opponent([match_data])
+    # Flop OOP: 2 folds out of 3 raises = 66.7%
+    assert abs(profile['ftr_oop_Flop'] - 2/3) < 0.01
+    # Turn IP: 0 folds out of 1 = 0% BUT n=1 < 3, so should be nan
+    import math
+    assert math.isnan(profile['ftr_ip_Turn'])
+    assert profile['total_hands'] == 120
+
+
+def test_pf_fold_rate():
+    """Pre-flop fold rate computed from action rows."""
+    from opponent_profiler import aggregate_opponent
+    result = _parse_csv(SAMPLE_CSV)
+    profile = aggregate_opponent([result])
+    # Hand 0: opp (team 0) raised pre-flop (not a fold)
+    # Hand 1: opp (team 0) called pre-flop (not a fold)
+    assert profile['pf_fold_rate'] == 0.0

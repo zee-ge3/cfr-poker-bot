@@ -127,3 +127,61 @@ def parse_match_csv(content: str) -> dict:
         'rows': rows,
         'opp_slot': opp_slot,
     }
+
+
+# ── Metrics aggregation ────────────────────────────────────────────────────────
+
+def aggregate_opponent(match_data_list: list) -> dict:
+    """Aggregate multiple parsed match dicts into a single opponent profile.
+
+    Args:
+        match_data_list: list of dicts returned by parse_match_csv()
+
+    Returns dict with:
+        total_hands: int
+        pf_fold_rate: float
+        ftr_{pos}_{street}: float or nan (nan if n < 3)
+        ftr_{pos}_{street}_n: int (sample count)
+      where pos in ('oop', 'ip'), street in STREETS[1:]
+    """
+    total_hands = 0
+    ftr_counts = defaultdict(lambda: {'fold': 0, 'total': 0})
+    pf_fold_total = 0
+    pf_action_total = 0
+
+    for md in match_data_list:
+        if not md:
+            continue
+        total_hands += len(md.get('hands', []))
+
+        # FTR events
+        for ev in md.get('opp_ftr_events', []):
+            pos = 'ip' if ev['opp_is_ip'] else 'oop'
+            key = f"{pos}_{ev['street']}"
+            ftr_counts[key]['total'] += 1
+            if ev['folded']:
+                ftr_counts[key]['fold'] += 1
+
+        # Pre-flop fold rate from raw rows
+        opp_slot = md.get('opp_slot', 0)
+        for row in md.get('rows', []):
+            if row['street'] == 'Pre-Flop' and int(row['active_team']) == opp_slot:
+                pf_action_total += 1
+                if row['action_type'] == 'FOLD':
+                    pf_fold_total += 1
+
+    # Build profile
+    import math
+    profile = {'total_hands': total_hands}
+    profile['pf_fold_rate'] = pf_fold_total / pf_action_total if pf_action_total else 0.0
+
+    for pos in ('oop', 'ip'):
+        for street in STREETS[1:]:  # post-flop only, matching parse_match_csv
+            key = f"{pos}_{street}"
+            d = ftr_counts[key]
+            # Require n >= 3 for a meaningful rate; return nan otherwise
+            val = d['fold'] / d['total'] if d['total'] >= 3 else float('nan')
+            profile[f"ftr_{key}"] = val
+            profile[f"ftr_{key}_n"] = d['total']
+
+    return profile
