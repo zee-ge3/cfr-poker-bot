@@ -262,7 +262,7 @@ def load_spy_match_ids() -> set:
             try:
                 rec = json.loads(line)
                 if rec.get('bot') == 'spy':
-                    ids.add(rec['match_id'])
+                    ids.add(int(rec['match_id']))
             except json.JSONDecodeError:
                 pass
     return ids
@@ -342,7 +342,7 @@ def run_report(min_hands: int = MIN_HANDS, top_n: int = None):
         return
 
     # Print table
-    header = f"{'Rank':<5} {'Opponent':<22} {'PF-fold':>7} {'FTR-OOP-Flop':>12} {'FTR-IP-Flop':>11} {'Type':<14} {'Hands':>6}"
+    header = f"{'Rank':<5} {'Opponent':<22} {'PF-fold%':>7} {'FTR-OOP-Flop%':>12} {'FTR-IP-Flop%':>11} {'Type':<14} {'Hands':>6}"
     print(header)
     print("─" * len(header))
 
