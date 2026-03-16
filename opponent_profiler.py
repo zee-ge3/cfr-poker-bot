@@ -93,26 +93,24 @@ def parse_match_csv(content: str) -> dict:
         }
         hands.append(hand_info)
 
-        # Find fold-to-raise events: any raise on post-flop streets,
-        # record whether the responder folded.
-        # Only track post-flop streets (Pre-Flop raising is standard)
+        # Find fold-to-raise events: we raised, did opp fold?
+        # Pre-Flop raising is standard; only track post-flop streets
         for street in STREETS[1:]:
             s_rows = [r for r in h_rows if r['street'] == street
                       and r['action_type'] not in ('DISCARD',)]
-            # Find sequences: any raise, then the other player acts
+            # Find sequences: geoz raises, then opp acts
             for i, row in enumerate(s_rows):
-                if row['action_type'] == 'RAISE':
-                    raiser = int(row['active_team'])
-                    responder = 1 - raiser
-                    # Look for responder's next action
+                actor = int(row['active_team'])
+                if actor == geoz_slot and row['action_type'] == 'RAISE':  # only geoz raises
+                    # Look for opp's next action
                     for j in range(i + 1, len(s_rows)):
                         next_actor = int(s_rows[j]['active_team'])
-                        if next_actor == responder:
-                            responder_folded = s_rows[j]['action_type'] == 'FOLD'
+                        if next_actor == opp_slot:
+                            opp_folded = s_rows[j]['action_type'] == 'FOLD'
                             opp_ftr_events.append({
                                 'street': street,
                                 'opp_is_ip': opp_is_ip,
-                                'folded': responder_folded,
+                                'folded': opp_folded,
                             })
                             break
 

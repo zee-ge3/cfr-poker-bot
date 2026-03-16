@@ -49,9 +49,10 @@ def test_position_derivation_hand1():
 
 
 def test_fold_to_raise_detected():
-    """Hand 1 Flop: geoz (team 1) raised, opp (team 0) called → NOT a fold event.
-    Append a hand where geoz raises and opp folds to confirm fold detection works."""
-    # Hand 2: geoz raises flop, opp folds
+    """When geoz raises, opp fold events are detected correctly.
+    - Hand 2 Flop: geoz raises, opp folds → folded=True
+    - Hand 3 Flop: geoz raises, opp calls → folded=False
+    """
     csv_with_fold = SAMPLE_CSV + (
         "2,Pre-Flop,0,0,0,RAISE,4,0,0,[],[],[],[],[],1,2\n"
         "2,Pre-Flop,1,0,0,CALL,0,0,0,[],[],[],[],[],2,2\n"
@@ -59,11 +60,17 @@ def test_fold_to_raise_detected():
         "2,Flop,0,0,0,DISCARD,0,0,1,[],[],[],[],[],2,2\n"
         "2,Flop,1,0,0,RAISE,6,0,0,[],[],[],[],[],2,2\n"
         "2,Flop,0,0,0,FOLD,0,0,0,[],[],[],[],[],2,2\n"
+        "3,Pre-Flop,0,0,0,RAISE,4,0,0,[],[],[],[],[],1,2\n"
+        "3,Pre-Flop,1,0,0,CALL,0,0,0,[],[],[],[],[],2,2\n"
+        "3,Flop,1,0,0,DISCARD,0,0,1,[],[],[],[],[],2,2\n"
+        "3,Flop,0,0,0,DISCARD,0,0,1,[],[],[],[],[],2,2\n"
+        "3,Flop,1,0,0,RAISE,6,0,0,[],[],[],[],[],2,2\n"
+        "3,Flop,0,0,0,CALL,0,0,0,[],[],[],[],[],2,2\n"
     )
     result = _parse_csv(csv_with_fold)
     ftr_events = result['opp_ftr_events']
-    # Hand 1 Flop: geoz raised, opp called → folded=False
     # Hand 2 Flop: geoz raised, opp folded → folded=True
+    # Hand 3 Flop: geoz raised, opp called → folded=False
     assert any(e['folded'] for e in ftr_events), \
         "Expected at least one fold-to-raise event"
     assert any(not e['folded'] for e in ftr_events), \
