@@ -26,6 +26,7 @@ AUTH_EXPIRED_FLAG = REPO / ".auth_expired"
 SELECTOR_CONFIG = REPO / ".submit_selectors.json"
 
 BASE_URL = "https://aipoker.cmudsc.com"
+CLERK_FAPI = "https://clerk.cmudsc.com"   # Clerk Frontend API (derived from pk_live_Y2xlcmsuY211ZHNjLmNvbSQ)
 DEFAULT_INTERVAL = 15  # minutes
 
 
@@ -105,7 +106,10 @@ def setup():
     print("=" * 60)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=200)
+        browser = p.chromium.launch(
+            headless=False, slow_mo=200,
+            args=['--no-sandbox', '--disable-dev-shm-usage'],
+        )
         context = browser.new_context()
         page = context.new_page()
         page.goto(BASE_URL)
@@ -129,6 +133,101 @@ def setup():
             print("  You will need to set them manually in .submit_selectors.json")
             with open(SELECTOR_CONFIG, 'w') as f:
                 json.dump({"file_input": "input[type=file]", "submit_button": "button[type=submit]"}, f)
+
+        browser.close()
+
+    print("\nSetup complete. Run with --submit spy to deploy the spy bot.")
+
+
+def setup_manual(client_token: str):
+    """Headless setup for SSH environments: build session from a manually-provided
+    __client cookie value, then discover selectors headlessly.
+
+    How to get the __client token:
+      1. Open aipoker.cmudsc.com in your LOCAL browser and log in.
+      2. DevTools → Application → Cookies → aipoker.cmudsc.com
+      3. Copy the value of the __client cookie (the long one).
+      4. Pass it via --setup-manual <value>
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("ERROR: playwright not installed.")
+        sys.exit(1)
+
+    client_token = client_token.strip()
+    if not client_token:
+        print("ERROR: Empty token. Pass the __client cookie value as the argument.")
+        sys.exit(1)
+
+    # Build initial browser state with just the __client cookie
+    # Playwright expects storage_state format: {cookies: [...], origins: [...]}
+    import time as _time
+    initial_state = {
+        "cookies": [
+            {
+                "name": "__client",
+                "value": client_token,
+                "domain": "aipoker.cmudsc.com",
+                "path": "/",
+                "expires": int(_time.time()) + 86400 * 30,  # 30 days
+                "httpOnly": True,
+                "secure": True,
+                "sameSite": "None",
+            }
+        ],
+        "origins": [],
+    }
+    with open(BROWSER_STATE, "w") as f:
+        json.dump(initial_state, f, indent=2)
+    print(f"  Initial session written → {BROWSER_STATE}")
+
+    # Navigate headlessly to refresh the session and get __session JWT
+    print("  Refreshing session headlessly...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-dev-shm-usage'],
+        )
+        context = browser.new_context(storage_state=str(BROWSER_STATE))
+        page = context.new_page()
+
+        try:
+            page.goto(BASE_URL, timeout=15000)
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception as e:
+            print(f"  WARNING: Navigation issue ({e}) — proceeding anyway")
+
+        if "sign-in" in page.url or "login" in page.url:
+            print("  ERROR: Redirected to login — the __client token may be wrong or expired.")
+            print("  Make sure you copied the __client cookie (not __session or another cookie).")
+            browser.close()
+            BROWSER_STATE.unlink(missing_ok=True)
+            sys.exit(1)
+
+        print(f"  Authenticated. Current URL: {page.url}")
+
+        # Refresh session state to capture __session JWT
+        context.storage_state(path=str(BROWSER_STATE))
+        print(f"  Session saved → {BROWSER_STATE}")
+
+        # Navigate to submit page and discover selectors
+        print("  Discovering submission selectors...")
+        try:
+            page.goto(f"{BASE_URL}/submit", timeout=15000)
+            page.wait_for_load_state("networkidle", timeout=10000)
+            selectors = _discover_submit_selectors(page)
+        except Exception:
+            selectors = {}
+
+        if selectors:
+            with open(SELECTOR_CONFIG, "w") as f:
+                json.dump(selectors, f, indent=2)
+            print(f"  Selectors saved → {SELECTOR_CONFIG}: {selectors}")
+        else:
+            with open(SELECTOR_CONFIG, "w") as f:
+                json.dump({"file_input": "input[type=file]", "submit_button": "button[type=submit]"}, f)
+            print("  Could not auto-detect selectors — using defaults.")
 
         browser.close()
 
@@ -195,7 +294,10 @@ def submit_bot(bot: str) -> bool:
         print(f"  Built zip: {zip_path} ({os.path.getsize(zip_path)//1024}KB)")
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-dev-shm-usage'],
+            )
             context = browser.new_context(storage_state=str(BROWSER_STATE))
             page = context.new_page()
 
@@ -256,46 +358,56 @@ def _print_manual_fallback(zip_path: str, bot: str):
 
 # ── Session cookie extraction ─────────────────────────────────────────────────
 
-def get_session_cookie() -> str | None:
-    """Load saved browser state, navigate to dashboard to refresh Clerk JWT,
-    extract __session cookie. Returns cookie value or None on auth failure."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return None
-
+def _get_client_token() -> str | None:
+    """Read the __client token from .browser_state.json."""
     if not BROWSER_STATE.exists():
         return None
+    try:
+        with open(BROWSER_STATE) as f:
+            state = json.load(f)
+        for c in state.get("cookies", []):
+            if c.get("name") == "__client":
+                return c["value"]
+    except Exception:
+        pass
+    return None
+
+
+def get_session_cookie() -> str | None:
+    """Get a fresh __session JWT via Clerk FAPI (no browser required).
+
+    Reads the long-lived __client token from .browser_state.json and calls
+    the Clerk Frontend API to obtain a fresh short-lived session JWT.
+    Returns the JWT string or None on auth failure.
+    """
+    import urllib.request
+
+    client_token = _get_client_token()
+    if not client_token:
+        return None
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(storage_state=str(BROWSER_STATE))
-            page = context.new_page()
+        url = f"{CLERK_FAPI}/v1/client?_clerk_js_version=4.73.4"
+        req = urllib.request.Request(url, headers={
+            "Cookie": f"__client={client_token}",
+            "User-Agent": "Mozilla/5.0 (poker-spy-daemon/1.0)",
+            "Origin": BASE_URL,
+            "Referer": BASE_URL + "/",
+        })
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
 
-            # Navigate to dashboard — Clerk client auto-refreshes __session JWT
-            page.goto(f"{BASE_URL}/dashboard.data?page=1&rows=1", timeout=15000)
-            page.wait_for_load_state("networkidle", timeout=10000)
+        sessions = data.get("response", {}).get("sessions", [])
+        if not sessions:
+            return None
 
-            # Check for redirect (auth expired)
-            if "sign-in" in page.url or "login" in page.url:
-                browser.close()
-                return None
-
-            # Extract __session cookie
-            cookies = context.cookies()
-            session_cookie = next(
-                (c["value"] for c in cookies if c["name"] == "__session"),
-                None
-            )
-
-            # Persist refreshed state
-            context.storage_state(path=str(BROWSER_STATE))
-            browser.close()
-            return session_cookie
+        # Use the first active session
+        active = next((s for s in sessions if s.get("status") == "active"), sessions[0])
+        jwt = active.get("last_active_token", {}).get("jwt")
+        return jwt or None
 
     except Exception as e:
-        print(f"  [daemon] Session refresh error: {e}")
+        print(f"  [daemon] Clerk API session refresh error: {e}")
         return None
 
 
@@ -450,6 +562,8 @@ def main():
     parser = argparse.ArgumentParser(description="Playwright bot automation")
     parser.add_argument("--setup", action="store_true",
                         help="Interactive login + save session + discover selectors")
+    parser.add_argument("--setup-manual", metavar="CLIENT_TOKEN",
+                        help="Headless setup (SSH-friendly): pass __client cookie value from your browser")
     parser.add_argument("--submit", choices=["spy", "main"],
                         help="Submit spy or main bot")
     parser.add_argument("--daemon", action="store_true",
@@ -462,6 +576,8 @@ def main():
 
     if args.setup:
         setup()
+    elif args.setup_manual:
+        setup_manual(args.setup_manual)
     elif args.submit:
         ok = submit_bot(args.submit)
         sys.exit(0 if ok else 1)
