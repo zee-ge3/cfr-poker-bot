@@ -54,7 +54,7 @@ Every action tagged with four fields written to agent log:
 This enables the profiler to ask position-stratified questions (e.g., "how often does opponent X fold to a raise when *they* are OOP on the turn?").
 
 ### Adaptation Detection
-Track opponent fold-to-raise rate in hands 1–500 vs. 501–1000, comparing **same-mode hands only** (raise-mode hands in both halves, to avoid noise from mode randomization). If the delta exceeds 25 percentage points, flag the match as "opponent adapted." 25pp threshold (not 15pp) avoids false positives from random mode flips adding variance. Adapted matches are down-weighted in profiler aggregation.
+Track opponent fold-to-raise rate in hands 1–500 vs. 501–1000, comparing **same-mode hands only** (raise-mode hands in both halves, to avoid noise from mode randomization). Raise-mode hands inferred from CSV by observing our IP pre-flop raise action; hands where we limped or the mode was flipped (our OOP raise) are excluded from the comparison. If the delta exceeds 25 percentage points, flag the match as "opponent adapted." 25pp threshold (not 15pp) avoids false positives from random mode flips adding variance. Adapted matches are down-weighted in profiler aggregation.
 
 ---
 
