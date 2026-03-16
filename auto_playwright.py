@@ -252,3 +252,224 @@ def _print_manual_fallback(zip_path: str, bot: str):
     print(f"  2. Navigate to the bot submission page")
     print(f"  3. Upload the zip file manually ({bot} bot)")
     print("  ────────────────────")
+
+
+# ── Session cookie extraction ─────────────────────────────────────────────────
+
+def get_session_cookie() -> str | None:
+    """Load saved browser state, navigate to dashboard to refresh Clerk JWT,
+    extract __session cookie. Returns cookie value or None on auth failure."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+
+    if not BROWSER_STATE.exists():
+        return None
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(storage_state=str(BROWSER_STATE))
+            page = context.new_page()
+
+            # Navigate to dashboard — Clerk client auto-refreshes __session JWT
+            page.goto(f"{BASE_URL}/dashboard.data?page=1&rows=1", timeout=15000)
+            page.wait_for_load_state("networkidle", timeout=10000)
+
+            # Check for redirect (auth expired)
+            if "sign-in" in page.url or "login" in page.url:
+                browser.close()
+                return None
+
+            # Extract __session cookie
+            cookies = context.cookies()
+            session_cookie = next(
+                (c["value"] for c in cookies if c["name"] == "__session"),
+                None
+            )
+
+            # Persist refreshed state
+            context.storage_state(path=str(BROWSER_STATE))
+            browser.close()
+            return session_cookie
+
+    except Exception as e:
+        print(f"  [daemon] Session refresh error: {e}")
+        return None
+
+
+# ── JSONL logger ─────────────────────────────────────────────────────────────
+
+def _log_matches(new_match_ids: set, current_bot: str, leaderboard: list):
+    """For each new match ID, parse the CSV and write a JSONL line."""
+    import csv as csv_mod
+
+    lb_by_name = {t['name']: t for t in leaderboard}
+    logs_dir = REPO / "tournament_logs"
+
+    for mid in new_match_ids:
+        csv_path = logs_dir / f"match_{mid}.csv"
+        if not csv_path.exists():
+            continue
+        try:
+            with open(csv_path) as f:
+                content = f.read()
+            lines = content.splitlines()
+            header_line = lines[0] if lines else ""
+            m = re.match(r"#\s*Team\s*0:\s*(.+?),\s*Team\s*1:\s*(.+)", header_line)
+            if not m:
+                continue
+            t0, t1 = m.group(1).strip(), m.group(2).strip()
+            our_slot = 0 if "geoz" in t0.lower() else 1
+            opp_name = t1 if our_slot == 0 else t0
+            our_col = f"team_{our_slot}_bankroll"
+
+            data_lines = [l for l in lines if not l.startswith("#")]
+            rows = list(csv_mod.DictReader(data_lines))
+            if not rows:
+                continue
+            net = float(rows[-1].get(our_col, 0))
+            result = "WON" if net > 0 else "LOST"
+
+            opp_data = lb_by_name.get(opp_name, {})
+            record = {
+                "ts": datetime.now().isoformat(timespec='seconds'),
+                "match_id": mid,
+                "bot": current_bot,
+                "opponent": opp_name,
+                "opp_rank": opp_data.get("rank"),
+                "opp_elo": opp_data.get("elo"),
+                "result": result,
+                "net": net,
+            }
+            with open(OVERNIGHT_LOG, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            print(f"  [daemon] Failed to log match {mid}: {e}")
+
+
+def _fetch_leaderboard() -> list:
+    """Fetch leaderboard (no auth needed). Returns list of team dicts."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"{BASE_URL}/leaderboard",
+            headers={"User-Agent": "Mozilla/5.0 (poker-spy-daemon/1.0)"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            html = r.read().decode("utf-8")
+
+        teams = []
+        for row in re.split(r'<tr class="border-b', html)[1:]:
+            rank_m = re.search(r'#<!-- -->(\d+)', row)
+            name_m = re.search(r'<span class="transition-colors duration-200">([^<]+)</span>', row)
+            nums = re.findall(r'text-right">(\d+)</td>', row)
+            wr_m = re.search(r'<span>([\d.]+)<!-- -->%</span>', row)
+            if not (rank_m and name_m and wr_m and len(nums) >= 3):
+                continue
+            teams.append({
+                "rank": int(rank_m.group(1)),
+                "name": name_m.group(1).strip(),
+                "elo": int(nums[1]),
+                "matches": int(nums[2]),
+            })
+        return teams
+    except Exception as e:
+        print(f"  [daemon] Leaderboard fetch failed: {e}")
+        return []
+
+
+# ── Daemon loop ───────────────────────────────────────────────────────────────
+
+def run_daemon(interval_minutes: int = DEFAULT_INTERVAL, current_bot: str = "spy"):
+    """Overnight loop: refresh session, fetch logs, snapshot leaderboard."""
+    import auto_fetch_logs
+
+    print(f"Daemon started. Interval: {interval_minutes}m. Bot: {current_bot}")
+    print(f"Overnight log: {OVERNIGHT_LOG}")
+    print(f"Press Ctrl+C to stop.\n")
+
+    # Clear stale auth flag
+    AUTH_EXPIRED_FLAG.unlink(missing_ok=True)
+
+    auth_ok = True
+    cycle = 0
+
+    while True:
+        cycle += 1
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"[{ts}] Cycle {cycle}")
+
+        # Always try leaderboard (no auth required)
+        leaderboard = _fetch_leaderboard()
+        if leaderboard:
+            our = next((t for t in leaderboard if t['name'] == 'geoz'), None)
+            if our:
+                print(f"  geoz: rank #{our['rank']}  ELO {our['elo']}  matches {our['matches']}")
+
+        # Auth-dependent: log fetch
+        cookie = get_session_cookie()
+        if not cookie:
+            if auth_ok:
+                print(f"  [!] Auth expired — log fetching paused. Leaderboard still polling.")
+                AUTH_EXPIRED_FLAG.touch()
+                print('\a')  # terminal bell
+            auth_ok = False
+        else:
+            if not auth_ok:
+                print(f"  [+] Auth restored.")
+                AUTH_EXPIRED_FLAG.unlink(missing_ok=True)
+            auth_ok = True
+
+            # Get existing match IDs before fetch
+            existing_ids = auto_fetch_logs.existing_match_ids()
+
+            # Fetch new logs
+            new_count, total, ok = auto_fetch_logs.run_fetch(
+                cookie, analyze=False, dry_run=False
+            )
+            if ok and new_count > 0:
+                # Find newly added match IDs
+                after_ids = auto_fetch_logs.existing_match_ids()
+                new_ids = after_ids - existing_ids
+                print(f"  +{new_count} new matches (total {total})")
+                _log_matches(new_ids, current_bot, leaderboard)
+            elif ok:
+                print(f"  No new matches.")
+
+        # Sleep until next cycle
+        sleep_secs = interval_minutes * 60
+        print(f"  Next cycle in {interval_minutes}m...")
+        time.sleep(sleep_secs)
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Playwright bot automation")
+    parser.add_argument("--setup", action="store_true",
+                        help="Interactive login + save session + discover selectors")
+    parser.add_argument("--submit", choices=["spy", "main"],
+                        help="Submit spy or main bot")
+    parser.add_argument("--daemon", action="store_true",
+                        help="Start overnight log fetch daemon")
+    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL,
+                        help="Daemon interval in minutes (default: 15)")
+    parser.add_argument("--bot", choices=["spy", "main"], default="spy",
+                        help="Which bot is currently submitted (for daemon JSONL tagging)")
+    args = parser.parse_args()
+
+    if args.setup:
+        setup()
+    elif args.submit:
+        ok = submit_bot(args.submit)
+        sys.exit(0 if ok else 1)
+    elif args.daemon:
+        run_daemon(interval_minutes=args.interval, current_bot=args.bot)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
