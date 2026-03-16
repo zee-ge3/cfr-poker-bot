@@ -172,3 +172,8 @@ agent_logs/
 
 # Git worktrees
 .worktrees/
+.browser_state.json
+.session_cookie
+.auth_expired
+.submit_selectors.json
+overnight_log.jsonl
