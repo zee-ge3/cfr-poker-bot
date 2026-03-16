@@ -84,3 +84,79 @@ def build_zip(bot: str, out_path: str) -> None:
 
         # The bot's player.py (renamed if spy)
         zf.write(player_src, "aipoker/submission/player.py")
+
+
+# ── Playwright session management ────────────────────────────────────────────
+
+def setup():
+    """Interactive one-time setup: login + save session state + discover submission selectors."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("ERROR: playwright not installed. Run: pip install playwright && playwright install chromium")
+        sys.exit(1)
+
+    print("=" * 60)
+    print("  auto_playwright SETUP")
+    print("  1. A browser window will open.")
+    print("  2. Log into aipoker.cmudsc.com manually.")
+    print("  3. Navigate to the bot submission page.")
+    print("  4. DO NOT close the browser — press Enter here when ready.")
+    print("=" * 60)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False, slow_mo=200)
+        context = browser.new_context()
+        page = context.new_page()
+        page.goto(BASE_URL)
+
+        input("\nPress Enter once you have logged in and are on the submission page... ")
+
+        # Save full browser state (cookies + localStorage)
+        context.storage_state(path=str(BROWSER_STATE))
+        print(f"  Session saved → {BROWSER_STATE}")
+
+        # Discover submission form selectors
+        print("\nDiscovering submission page selectors...")
+        selectors = _discover_submit_selectors(page)
+        if selectors:
+            with open(SELECTOR_CONFIG, 'w') as f:
+                json.dump(selectors, f, indent=2)
+            print(f"  Selectors saved → {SELECTOR_CONFIG}")
+            print(f"  Found: {selectors}")
+        else:
+            print("  WARNING: Could not auto-detect selectors.")
+            print("  You will need to set them manually in .submit_selectors.json")
+            with open(SELECTOR_CONFIG, 'w') as f:
+                json.dump({"file_input": "input[type=file]", "submit_button": "button[type=submit]"}, f)
+
+        browser.close()
+
+    print("\nSetup complete. Run with --submit spy to deploy the spy bot.")
+
+
+def _discover_submit_selectors(page) -> dict:
+    """Try to find file input and submit button on the current page."""
+    selectors = {}
+    # Common file input patterns
+    for sel in ["input[type='file']", "input[accept]", "input[name*='file']", "input[name*='bot']"]:
+        try:
+            el = page.query_selector(sel)
+            if el:
+                selectors['file_input'] = sel
+                break
+        except Exception:
+            pass
+
+    # Common submit button patterns
+    for sel in ["button[type='submit']", "button:has-text('Submit')", "button:has-text('Upload')",
+                "input[type='submit']", "button:has-text('Deploy')"]:
+        try:
+            el = page.query_selector(sel)
+            if el:
+                selectors['submit_button'] = sel
+                break
+        except Exception:
+            pass
+
+    return selectors if len(selectors) == 2 else {}
