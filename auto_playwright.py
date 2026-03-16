@@ -160,3 +160,95 @@ def _discover_submit_selectors(page) -> dict:
             pass
 
     return selectors if len(selectors) == 2 else {}
+
+
+def submit_bot(bot: str) -> bool:
+    """Build zip and upload via Playwright. Returns True on success.
+
+    bot: 'spy' | 'main'
+    On failure: prints manual fallback instructions.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("ERROR: playwright not installed.")
+        return False
+
+    if not BROWSER_STATE.exists():
+        print("ERROR: No saved session. Run --setup first.")
+        return False
+
+    if not SELECTOR_CONFIG.exists():
+        print("ERROR: No selector config. Run --setup first.")
+        return False
+
+    with open(SELECTOR_CONFIG) as f:
+        selectors = json.load(f)
+
+    # Build zip to temp file
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as tf:
+        zip_path = tf.name
+
+    try:
+        build_zip(bot, zip_path)
+        print(f"  Built zip: {zip_path} ({os.path.getsize(zip_path)//1024}KB)")
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(storage_state=str(BROWSER_STATE))
+            page = context.new_page()
+
+            # Navigate to submission page
+            print(f"  Navigating to submission page...")
+            page.goto(f"{BASE_URL}/submit", timeout=15000)
+            page.wait_for_load_state("networkidle", timeout=15000)
+
+            # Upload file
+            file_input_sel = selectors.get('file_input', "input[type='file']")
+            try:
+                page.set_input_files(file_input_sel, zip_path)
+                print(f"  File set on input: {file_input_sel}")
+            except Exception as e:
+                print(f"  ERROR: Could not set file input ({e})")
+                _print_manual_fallback(zip_path, bot)
+                browser.close()
+                return False
+
+            # Click submit
+            submit_sel = selectors.get('submit_button', "button[type='submit']")
+            try:
+                page.click(submit_sel, timeout=5000)
+                page.wait_for_load_state("networkidle", timeout=15000)
+                print(f"  Submit clicked. Current URL: {page.url}")
+            except Exception as e:
+                print(f"  ERROR: Could not click submit ({e})")
+                _print_manual_fallback(zip_path, bot)
+                browser.close()
+                return False
+
+            # Update saved session state (refresh tokens)
+            context.storage_state(path=str(BROWSER_STATE))
+            browser.close()
+
+        print(f"  Submission complete: bot={bot}")
+        return True
+
+    except Exception as e:
+        print(f"  ERROR during submission: {e}")
+        _print_manual_fallback(zip_path, bot)
+        return False
+    finally:
+        try:
+            os.unlink(zip_path)
+        except Exception:
+            pass
+
+
+def _print_manual_fallback(zip_path: str, bot: str):
+    print("\n  ── MANUAL FALLBACK ──")
+    print(f"  Zip file: {zip_path}")
+    print(f"  1. Open {BASE_URL} in browser")
+    print(f"  2. Navigate to the bot submission page")
+    print(f"  3. Upload the zip file manually ({bot} bot)")
+    print("  ────────────────────")
