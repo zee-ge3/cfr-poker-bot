@@ -33,7 +33,7 @@ Each hand, the bot selects a primary mode based on position:
 - **IP (button, acts last post-flop):** Raise mode — probe every street to measure fold-to-raise
 - **OOP (big blind, acts first post-flop):** Call mode — call all bets to showdown to collect hand strength + sizing data
 
-Position detection: compare `obs["my_bet"]` vs `obs["opp_bet"]` at street 0.
+Position detection: `obs.get("blind_position", 0) == 0` indicates IP (SB/button, acts last post-flop). This matches how both existing bots detect position (`player.py` line 709, `claude2_player.py` line 643).
 
 ### Disguise Layer
 Opponents may model the spy bot and adapt, contaminating data. To prevent this:
@@ -54,7 +54,7 @@ Every action tagged with four fields written to agent log:
 This enables the profiler to ask position-stratified questions (e.g., "how often does opponent X fold to a raise when *they* are OOP on the turn?").
 
 ### Adaptation Detection
-Track opponent fold-to-raise rate in hands 1–500 vs. 501–1000. If the delta exceeds 15 percentage points, flag the match as "opponent adapted." Adapted matches are down-weighted in profiler aggregation.
+Track opponent fold-to-raise rate in hands 1–500 vs. 501–1000, comparing **same-mode hands only** (raise-mode hands in both halves, to avoid noise from mode randomization). If the delta exceeds 25 percentage points, flag the match as "opponent adapted." 25pp threshold (not 15pp) avoids false positives from random mode flips adding variance. Adapted matches are down-weighted in profiler aggregation.
 
 ---
 
@@ -74,12 +74,14 @@ python auto_playwright.py --setup
 
 ### Bot Submission
 ```
-python auto_playwright.py --submit <path_to_zip_or_py>
+python auto_playwright.py --submit spy    # swap in spy bot
+python auto_playwright.py --submit main   # swap back main bot
 ```
 - Loads `.browser_state.json` headlessly
-- Builds zip if a `.py` file is passed (using `create_release.sh` logic)
-- Navigates to submission page, uploads file, confirms success
-- Used to swap spy bot in before bed and main bot back in the morning
+- Builds zip using inline zip logic (not `create_release.sh` — that script contains a dead AWS S3 upload path that fails without credentials). The zip logic is reimplemented in `auto_playwright.py` directly.
+- **Submission conflict:** The tournament expects exactly one bot per zip. When submitting `spy`, `submission/spy_player.py` is zipped as `submission/player.py` (replacing the original). When submitting `main`, the original `submission/player.py` is used. The original is never deleted from disk — only the zip contents differ.
+- Navigates to submission page, uploads zip via file input element (selector validated during `--setup`), confirms success
+- On failure: prints clear error with manual fallback instructions (navigate to aipoker.cmudsc.com/submit, upload zip manually)
 
 ### Daemon Mode
 ```
@@ -89,11 +91,12 @@ Every 15 minutes:
 1. Load saved browser state headlessly
 2. Navigate to dashboard — Clerk client token auto-refreshes `__session` JWT
 3. Extract fresh `__session` cookie from browser context
-4. Call `auto_fetch_logs.run_fetch(cookie)` directly (no subprocess)
-5. Fetch current leaderboard, snapshot ranks to `overnight_log.jsonl`
-6. Append new match IDs with opponent name + their rank at time of match
+4. Call `auto_fetch_logs.run_fetch(cookie, analyze=False)` directly (no subprocess; `analyze=False` suppresses stdout noise in unattended mode)
+5. For each newly downloaded CSV: parse opponent name via `detect_our_slot()`, compute net chips from last row's bankroll column, record result
+6. Fetch current leaderboard (no auth required — publicly accessible), snapshot ranks to `overnight_log.jsonl`
+7. Append one JSONL line per new match with opponent name + their rank at time of match
 
-If auth fails (session revoked): write `.auth_expired` flag file, emit terminal bell, continue polling without fetching.
+If auth fails (session revoked): write `.auth_expired` flag file, emit terminal bell, **continue polling leaderboard** (no auth needed) but skip log fetching until auth is restored.
 
 ### Leaderboard Tagging
 Each fetch cycle writes a JSONL line:
@@ -109,9 +112,12 @@ This lets the profiler separate analysis by opponent tier (top-20 vs. bottom-20)
 ### File: `opponent_profiler.py`
 
 ### Input
-- All CSVs in `tournament_logs/` tagged as spy-bot matches (by bot name in filename)
+- All CSVs in `tournament_logs/` tagged as spy-bot matches (by bot name in filename, e.g. `match_6123_bot_SpyAgent.csv`)
 - `overnight_log.jsonl` for leaderboard rank snapshots
-- Agent logs for position-tagged action data
+- **No agent log parsing** — all metrics derived from CSV data only. CSV contains all action rows with `active_team`, `street`, and bankroll columns sufficient to reconstruct position and action sequences.
+
+### Position Derivation from CSV
+The CSV does not include a `blind_position` column. Position is inferred per hand: on `street=0` (pre-flop), the first `active_team` value that appears is the player who acts first pre-flop (the big blind / OOP player post-flop). This is consistent with how `gym_env.py` structures the observation order.
 
 ### Metrics Computed Per Opponent
 | Metric | Description |
@@ -123,19 +129,19 @@ This lets the profiler separate analysis by opponent tier (top-20 vs. bottom-20)
 | `avg_bet_frac_{street}` | Average bet as fraction of pot, by street |
 | `sd_hand_dist` | Showdown hand type distribution (pair/two-pair/trips/flush/etc.) |
 | `type` | Classified opponent type: TAG / LAG / calling-station / maniac |
-| `adapts` | Whether fold-to-raise rate dropped >15pp in second half |
+| `adapts` | Whether fold-to-raise rate dropped >25pp in second half (same-mode hands only) |
 
 ### Output: Ranked Table
-Sorted by current leaderboard rank, minimum 30 hands of data:
+Sorted by current leaderboard rank, minimum **100 hands** of data (ensures 8 position×street cells have adequate samples). Sample count shown per cell where n<20:
 ```
-Rank  Opponent            PF-fold  FTR-OOP  FTR-IP  AvgBet  Type     Adapts?
-#1    WW                   12%      82%      45%     1.1x    maniac   no
-#5    GradientAscent       31%      58%      39%     0.7x    lag      yes
-#12   sheep army           22%      64%      51%     0.5x    lag      no
+Rank  Opponent            PF-fold  FTR-OOP  FTR-IP  AvgBet  Type     Adapts?  Hands
+#1    WW                   12%      82%      45%     1.1x    maniac   no       312
+#5    GradientAscent       31%      58%      39%     0.7x    lag      yes      187
+#12   sheep army           22%      64%      51%     0.5x    lag      no       241
 ```
 
 ### Auto-Generated Exploit Notes
-For each top-20 opponent with ≥30 hands:
+For each top-20 opponent with ≥100 hands:
 ```
 WW (#1): folds 82% OOP post-flop → raise every street when they're OOP, small sizing (0.5x) for max EV
 GradientAscent (#5): adapts ~hand 200, large bets = value → bluff-raise heavy in first 200 hands only
