@@ -99,11 +99,11 @@ Every 15 minutes:
 If auth fails (session revoked): write `.auth_expired` flag file, emit terminal bell, **continue polling leaderboard** (no auth needed) but skip log fetching until auth is restored.
 
 ### Leaderboard Tagging
-Each fetch cycle writes a JSONL line:
+Each fetch cycle writes a JSONL line per new match:
 ```json
-{"ts": "2026-03-16T02:15:00", "match_id": 6123, "opponent": "WW", "opp_rank": 1, "opp_elo": 1842, "result": "LOST", "net": -312}
+{"ts": "2026-03-16T02:15:00", "match_id": 6123, "bot": "spy", "opponent": "WW", "opp_rank": 1, "opp_elo": 1842, "result": "LOST", "net": -312}
 ```
-This lets the profiler separate analysis by opponent tier (top-20 vs. bottom-20).
+The `"bot"` field records which submission was active at fetch time (`"spy"` or `"main"`). This is how `opponent_profiler.py` identifies which match IDs belong to spy-bot sessions. It also lets the profiler separate analysis by opponent tier (top-20 vs. bottom-20).
 
 ---
 
@@ -112,19 +112,21 @@ This lets the profiler separate analysis by opponent tier (top-20 vs. bottom-20)
 ### File: `opponent_profiler.py`
 
 ### Input
-- All CSVs in `tournament_logs/` tagged as spy-bot matches (by bot name in filename, e.g. `match_6123_bot_SpyAgent.csv`)
-- `overnight_log.jsonl` for leaderboard rank snapshots
+- CSVs in `tournament_logs/` for spy-bot matches, identified by match ID cross-reference with `overnight_log.jsonl` (CSV filenames are `match_{id}.csv` with no bot name embedded; the JSONL records which bot was active during each fetch window)
+- `overnight_log.jsonl` for leaderboard rank snapshots and spy-bot match ID list
 - **No agent log parsing** — all metrics derived from CSV data only. CSV contains all action rows with `active_team`, `street`, and bankroll columns sufficient to reconstruct position and action sequences.
 
 ### Position Derivation from CSV
-The CSV does not include a `blind_position` column. Position is inferred per hand: on `street=0` (pre-flop), the first `active_team` value that appears is the player who acts first pre-flop (the big blind / OOP player post-flop). This is consistent with how `gym_env.py` structures the observation order.
+The CSV does not include a `blind_position` column. Position is inferred per hand: on street `"Pre-Flop"`, the first `active_team` value that appears is the **SB (IP post-flop)**. The other team is the BB (OOP post-flop). This matches `gym_env.py` which initializes `acting_agent = small_blind_player` pre-flop and switches to `big_blind_player` first on post-flop streets.
+
+Note: the `street` column contains strings — `"Pre-Flop"`, `"Flop"`, `"Turn"`, `"River"` — not integers. All profiler street comparisons must use these string values directly.
 
 ### Metrics Computed Per Opponent
 | Metric | Description |
 |--------|-------------|
 | `pf_fold_rate` | Pre-flop fold rate |
 | `vpip` | Voluntarily put money in pot rate |
-| `ftr_oop_{street}` | Fold-to-raise when opponent is OOP, by street |
+| `ftr_oop_{street}` | Fold-to-raise when opponent is OOP, by street (`Pre-Flop`/`Flop`/`Turn`/`River`) |
 | `ftr_ip_{street}` | Fold-to-raise when opponent is IP, by street |
 | `avg_bet_frac_{street}` | Average bet as fraction of pot, by street |
 | `sd_hand_dist` | Showdown hand type distribution (pair/two-pair/trips/flush/etc.) |
