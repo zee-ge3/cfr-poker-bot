@@ -33,6 +33,7 @@ def parse_match_csv(content: str) -> dict:
 
     Returns dict with:
       geoz_slot: 0 or 1
+      opp_slot: 1 - geoz_slot
       opp_name: str
       hands: list of per-hand dicts
       opp_ftr_events: list of (street, opp_is_ip, folded) dicts
@@ -81,11 +82,12 @@ def parse_match_csv(content: str) -> dict:
         h_rows = hand_rows[hand_num]
 
         # Derive opp position: first Pre-Flop actor is SB = IP post-flop
+        # Heads-up rules: first Pre-Flop actor = SB, SB acts last post-flop = IP
         pf_rows = [r for r in h_rows if r['street'] == 'Pre-Flop']
         opp_is_ip = None
         if pf_rows:
             first_actor = int(pf_rows[0]['active_team'])
-            opp_is_ip = (first_actor == opp_slot)  # opp is SB → IP
+            opp_is_ip = (first_actor == opp_slot)  # opp is SB → IP post-flop
 
         hand_info = {
             'hand_num': hand_num,
@@ -93,15 +95,17 @@ def parse_match_csv(content: str) -> dict:
         }
         hands.append(hand_info)
 
-        # Find fold-to-raise events: we raised, did opp fold?
-        # Pre-Flop raising is standard; only track post-flop streets
-        for street in STREETS[1:]:
+        # Find fold-to-raise events: we raised, did opp fold? (one event per street per hand)
+        for street in STREETS[1:]:  # post-flop only; Pre-Flop fold rate tracked via pf_fold_rate
             s_rows = [r for r in h_rows if r['street'] == street
                       and r['action_type'] not in ('DISCARD',)]
-            # Find sequences: geoz raises, then opp acts
+            # Record at most one FTR event per street per hand
+            recorded_this_street = False
             for i, row in enumerate(s_rows):
+                if recorded_this_street:
+                    break
                 actor = int(row['active_team'])
-                if actor == geoz_slot and row['action_type'] == 'RAISE':  # only geoz raises
+                if actor == geoz_slot and row['action_type'] == 'RAISE':
                     # Look for opp's next action
                     for j in range(i + 1, len(s_rows)):
                         next_actor = int(s_rows[j]['active_team'])
@@ -112,6 +116,7 @@ def parse_match_csv(content: str) -> dict:
                                 'opp_is_ip': opp_is_ip,
                                 'folded': opp_folded,
                             })
+                            recorded_this_street = True
                             break
 
     return {
