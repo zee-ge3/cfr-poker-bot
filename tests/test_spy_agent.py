@@ -62,3 +62,52 @@ def test_oop_defaults_to_call_mode():
         if action[0] in (AT.CALL.value, AT.CHECK.value):
             call_count += 1
     assert call_count / n >= 0.70, f"OOP call/check rate {call_count/n:.2%} < 70%"
+
+
+def test_discard_always_handled():
+    """When DISCARD is valid, always returns DISCARD action."""
+    agent = SpyAgent(stream=False)
+    valid = [False] * 6
+    valid[AT.DISCARD.value] = True
+    obs = make_obs(valid=valid)
+    for _ in range(20):
+        action = agent.act(obs, 0, False, False, {})
+        assert action[0] == AT.DISCARD.value
+        assert action[2] == 0  # keep card index 0
+        assert action[3] == 1  # keep card index 1
+
+
+def test_mode_flip_occurs():
+    """Roughly 20% of hands flip mode — test over 500 hands."""
+    import random
+    random.seed(7)
+    agent = SpyAgent(stream=False)
+    ip_raise_mode = 0
+    ip_call_mode = 0
+    for _ in range(500):
+        agent._reset_hand_state()
+        obs = make_obs(blind_position=0, street=0)
+        agent._hand_mode = agent._select_mode(obs)
+        if agent._hand_mode == 'raise':
+            ip_raise_mode += 1
+        else:
+            ip_call_mode += 1
+    # Expect ~80% raise, ~20% call for IP hands
+    flip_rate = ip_call_mode / 500
+    assert 0.12 <= flip_rate <= 0.28, f"flip rate {flip_rate:.2%} outside [12%, 28%]"
+
+
+def test_raise_sizing_varies():
+    """Raise amounts vary across calls (not always same size)."""
+    import random
+    random.seed(1)
+    agent = SpyAgent(stream=False)
+    agent._hand_mode = 'raise'
+    obs = make_obs(blind_position=0, street=2, my_bet=10, opp_bet=10,
+                   min_raise=2, max_raise=200)
+    amounts = set()
+    for _ in range(30):
+        action = agent.act(obs, 0, False, False, {})
+        if action[0] == AT.RAISE.value:
+            amounts.add(action[1])
+    assert len(amounts) >= 3, f"Only {len(amounts)} distinct raise sizes — not varying enough"
