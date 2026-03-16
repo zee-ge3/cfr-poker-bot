@@ -248,3 +248,143 @@ def generate_exploit_note(opp_name: str, rank: int, profile: dict) -> str:
 
     rank_str = f"(#{rank})" if rank is not None else ""
     return f"{opp_name} {rank_str}: " + "; ".join(notes)
+
+
+# ── Report runner ─────────────────────────────────────────────────────────────
+
+def load_spy_match_ids() -> set:
+    """Load match IDs that were played by the spy bot from overnight_log.jsonl."""
+    ids = set()
+    if not OVERNIGHT_LOG.exists():
+        return ids
+    with open(OVERNIGHT_LOG) as f:
+        for line in f:
+            try:
+                rec = json.loads(line)
+                if rec.get('bot') == 'spy':
+                    ids.add(rec['match_id'])
+            except json.JSONDecodeError:
+                pass
+    return ids
+
+
+def load_leaderboard_ranks() -> dict:
+    """Load most recent rank per opponent from overnight_log.jsonl."""
+    ranks = {}  # opp_name → {rank, elo}
+    if not OVERNIGHT_LOG.exists():
+        return ranks
+    with open(OVERNIGHT_LOG) as f:
+        for line in f:
+            try:
+                rec = json.loads(line)
+                opp = rec.get('opponent')
+                if opp and rec.get('opp_rank') is not None:
+                    ranks[opp] = {'rank': rec['opp_rank'], 'elo': rec.get('opp_elo')}
+            except json.JSONDecodeError:
+                pass
+    return ranks
+
+
+def run_report(min_hands: int = MIN_HANDS, top_n: int = None):
+    """Load spy-bot match logs, compute profiles, print ranked table + exploit notes."""
+    import math
+
+    spy_ids = load_spy_match_ids()
+    ranks = load_leaderboard_ranks()
+
+    if not spy_ids:
+        print("No spy-bot match IDs found in overnight_log.jsonl.")
+        print("Either the daemon hasn't run yet or --bot spy wasn't specified.")
+        return
+
+    print(f"Loading {len(spy_ids)} spy-bot match CSVs from {LOGS_DIR}...")
+
+    # Parse all spy match CSVs, group by opponent
+    by_opp = defaultdict(list)
+    missing = 0
+    for mid in spy_ids:
+        csv_path = LOGS_DIR / f"match_{mid}.csv"
+        if not csv_path.exists():
+            missing += 1
+            continue
+        with open(csv_path) as f:
+            content = f.read()
+        md = parse_match_csv(content)
+        if md:
+            by_opp[md['opp_name']].append(md)
+
+    if missing:
+        print(f"  Warning: {missing} CSVs not found in {LOGS_DIR}")
+
+    # Aggregate profiles
+    profiles = {}
+    for opp_name, matches in by_opp.items():
+        p = aggregate_opponent(matches)
+        p['match_count'] = len(matches)
+        profiles[opp_name] = p
+
+    # Filter by min hands
+    qualified = {k: v for k, v in profiles.items() if v['total_hands'] >= min_hands}
+    print(f"  {len(profiles)} opponents found, {len(qualified)} with ≥{min_hands} hands\n")
+
+    # Sort by leaderboard rank (unranked last)
+    def sort_key(item):
+        opp, _ = item
+        r = ranks.get(opp, {}).get('rank')
+        return r if r is not None else 9999
+
+    sorted_opps = sorted(qualified.items(), key=sort_key)
+    if top_n:
+        sorted_opps = sorted_opps[:top_n]
+
+    if not sorted_opps:
+        print("No opponents with sufficient data to report.")
+        return
+
+    # Print table
+    header = f"{'Rank':<5} {'Opponent':<22} {'PF-fold':>7} {'FTR-OOP-Flop':>12} {'FTR-IP-Flop':>11} {'Type':<14} {'Hands':>6}"
+    print(header)
+    print("─" * len(header))
+
+    for opp_name, profile in sorted_opps:
+        rank_info = ranks.get(opp_name, {})
+        rank = rank_info.get('rank', '?')
+        pf = profile.get('pf_fold_rate', float('nan'))
+        ftr_oop = profile.get('ftr_oop_Flop', float('nan'))
+        ftr_ip = profile.get('ftr_ip_Flop', float('nan'))
+
+        # Compute VPIP proxy from PF fold rate
+        vpip = 1.0 - pf if not math.isnan(pf) else 0.5
+        opp_type = classify_opponent_type(pf_fold_rate=pf if not math.isnan(pf) else 0.5,
+                                          vpip=vpip)
+
+        pf_str = f"{pf:.0%}" if not math.isnan(pf) else "  ?"
+        oop_str = f"{ftr_oop:.0%}" if not math.isnan(ftr_oop) else "  ?"
+        ip_str = f"{ftr_ip:.0%}" if not math.isnan(ftr_ip) else "  ?"
+
+        print(f"#{rank!s:<4} {opp_name:<22} {pf_str:>7} {oop_str:>12} {ip_str:>11} {opp_type:<14} {profile['total_hands']:>6}")
+
+    # Exploit notes
+    print(f"\n{'─'*60}")
+    print("EXPLOIT NOTES")
+    print("─" * 60)
+    for opp_name, profile in sorted_opps:
+        rank = ranks.get(opp_name, {}).get('rank')
+        note = generate_exploit_note(opp_name, rank, profile)
+        print(note)
+
+
+# ── CLI ─────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Opponent profiler — overnight log analysis")
+    parser.add_argument("--min-hands", type=int, default=MIN_HANDS,
+                        help=f"Minimum hands to include opponent (default: {MIN_HANDS})")
+    parser.add_argument("--top", type=int, default=None,
+                        help="Show only top-N ranked opponents")
+    args = parser.parse_args()
+    run_report(min_hands=args.min_hands, top_n=args.top)
+
+
+if __name__ == "__main__":
+    main()
