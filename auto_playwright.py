@@ -317,7 +317,7 @@ def _log_matches(new_match_ids: set, current_bot: str, leaderboard: list):
                 content = f.read()
             lines = content.splitlines()
             header_line = lines[0] if lines else ""
-            m = re.match(r"#\s*Team\s*0:\s*(.+?),\s*Team\s*1:\s*(.+)", header_line)
+            m = re.match(r"#\s*Team\s*0:\s*(.+?)\s*,\s*Team\s*1:\s*(.+)", header_line)
             if not m:
                 continue
             t0, t1 = m.group(1).strip(), m.group(2).strip()

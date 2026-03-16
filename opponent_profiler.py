@@ -162,12 +162,19 @@ def aggregate_opponent(match_data_list: list) -> dict:
             if ev['folded']:
                 ftr_counts[key]['fold'] += 1
 
-        # Pre-flop fold rate from raw rows
+        # Pre-flop fold rate: per-hand (fraction of hands where opp folded pre-flop)
         opp_slot = md.get('opp_slot', 0)
-        for row in md.get('rows', []):
-            if row['street'] == 'Pre-Flop' and int(row['active_team']) == opp_slot:
+        rows = md.get('rows', [])
+        if rows:
+            # Group Pre-Flop rows by hand number
+            from collections import defaultdict as _dd
+            pf_by_hand = _dd(list)
+            for row in rows:
+                if row['street'] == 'Pre-Flop' and int(row['active_team']) == opp_slot:
+                    pf_by_hand[row['hand_number']].append(row)
+            for hand_rows in pf_by_hand.values():
                 pf_action_total += 1
-                if row['action_type'] == 'FOLD':
+                if any(r['action_type'] == 'FOLD' for r in hand_rows):
                     pf_fold_total += 1
 
     # Build profile
