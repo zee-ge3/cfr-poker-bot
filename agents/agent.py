@@ -3,7 +3,8 @@ import os
 import sys
 import tempfile
 from abc import ABC, abstractmethod
-from typing import Any, List, Tuple, TypedDict
+from typing import Any, List, Tuple
+from typing_extensions import TypedDict
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -60,7 +61,8 @@ class Agent(ABC):
         """Set up a logger for this agent instance"""
         logger = logging.getLogger(self.__class__.__name__)
         logger.setLevel(logging.INFO)
-        
+        logger.propagate = False  # prevent double-logging via root logger
+
         # Clear any existing handlers to avoid duplicate logging
         logger.handlers.clear()
         

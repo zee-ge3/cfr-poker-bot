@@ -1,15 +1,15 @@
 {
     "bot0": {
         "file_path": "submission.player.PlayerAgent",
-        "port": 8000,
+        "port": 9500,
         "player_id": "bot0"
     },
     "bot1": {
-        "file_path": "agents.prob_agent.ProbabilityAgent",
-        "port": 8001,
+        "file_path": "submission.claude2_player.Claude2Agent",
+        "port": 9501,
         "player_id": "bot1"
     },
     "match_settings": {
         "csv_output_path": "./match.csv"
     }
-} 
+}

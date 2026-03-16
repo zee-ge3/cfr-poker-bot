@@ -142,7 +142,7 @@ class PokerEnv(gym.Env):
         self.observation_space = spaces.Tuple([observation_space_one_player for _ in range(2)])
 
         # New episode
-        self.reset(seed=int.from_bytes(os.urandom(32)))
+        self.reset(seed=int.from_bytes(os.urandom(32), 'big'))
 
     def _get_valid_actions(self, player_num: int):
         valid_actions = [1, 1, 1, 1, 1]
