@@ -185,3 +185,66 @@ def aggregate_opponent(match_data_list: list) -> dict:
             profile[f"ftr_{key}_n"] = d['total']
 
     return profile
+
+
+# ── Opponent type classification ───────────────────────────────────────────────
+
+def classify_opponent_type(pf_fold_rate: float, vpip: float,
+                           raise_rate: float = 0.5) -> str:
+    """Classify opponent into tag/lag/maniac/calling_station.
+
+    Args:
+        pf_fold_rate: fraction of pre-flop actions where opponent folds
+        vpip: voluntarily put money in pot rate (1 - pf_fold_rate proxy)
+        raise_rate: fraction of actions that are raises (default 0.5)
+
+    Returns one of: 'calling_station', 'maniac', 'lag', 'tag'
+    """
+    if vpip >= 0.80 and raise_rate < 0.15:
+        return 'calling_station'
+    if pf_fold_rate <= 0.15:
+        return 'maniac'
+    if pf_fold_rate <= 0.35:
+        return 'lag'
+    return 'tag'
+
+
+def generate_exploit_note(opp_name: str, rank: int, profile: dict) -> str:
+    """Generate a one-line exploit note from an opponent profile.
+
+    Args:
+        opp_name: opponent team name
+        rank: current leaderboard rank (or None)
+        profile: dict from aggregate_opponent()
+
+    Returns formatted exploit note string.
+    """
+    import math
+    notes = []
+
+    # High OOP fold-to-raise (post-flop) — biggest exploit signal
+    for street in ('Flop', 'Turn', 'River'):
+        rate = profile.get(f'ftr_oop_{street}', float('nan'))
+        n = profile.get(f'ftr_oop_{street}_n', 0)
+        if n >= 10 and not math.isnan(rate) and rate >= 0.65:
+            notes.append(f"folds {rate:.0%} OOP on {street} → raise every {street} when they're OOP")
+            break
+
+    # High IP fold-to-raise
+    for street in ('Flop', 'Turn'):
+        rate = profile.get(f'ftr_ip_{street}', float('nan'))
+        n = profile.get(f'ftr_ip_{street}_n', 0)
+        if n >= 10 and not math.isnan(rate) and rate >= 0.55:
+            notes.append(f"also folds {rate:.0%} IP on {street} → probe aggressively")
+            break
+
+    # Very low PF fold → blind steals useless
+    pf = profile.get('pf_fold_rate', 0.5)
+    if not math.isnan(pf) and pf < 0.10:
+        notes.append("never folds PF → skip blind steals, raise post-flop instead")
+
+    if not notes:
+        notes.append("no strong exploit signal yet")
+
+    rank_str = f"(#{rank})" if rank is not None else ""
+    return f"{opp_name} {rank_str}: " + "; ".join(notes)

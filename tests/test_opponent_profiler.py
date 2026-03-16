@@ -114,3 +114,15 @@ def test_pf_fold_rate():
     # Hand 0: opp (team 0) raised pre-flop (not a fold)
     # Hand 1: opp (team 0) called pre-flop (not a fold)
     assert profile['pf_fold_rate'] == 0.0
+
+
+def test_opponent_type_classification():
+    from opponent_profiler import classify_opponent_type
+    # Maniac: very low PF fold
+    assert classify_opponent_type(pf_fold_rate=0.05, vpip=0.95) == 'maniac'
+    # LAG: moderate-low PF fold, high VPIP
+    assert classify_opponent_type(pf_fold_rate=0.25, vpip=0.75) == 'lag'
+    # TAG: moderate PF fold
+    assert classify_opponent_type(pf_fold_rate=0.45, vpip=0.55) == 'tag'
+    # Calling station: high VPIP, low raise rate
+    assert classify_opponent_type(pf_fold_rate=0.05, vpip=0.95, raise_rate=0.05) == 'calling_station'
