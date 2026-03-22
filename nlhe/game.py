@@ -32,6 +32,13 @@ STREET_FLOP    = 1
 STREET_TURN    = 2
 STREET_RIVER   = 3
 
+STREET_NAMES = {
+    STREET_PREFLOP: 'preflop',
+    STREET_FLOP:    'flop',
+    STREET_TURN:    'turn',
+    STREET_RIVER:   'river',
+}
+
 # Number of board cards dealt at the start of each street
 _BOARD_CARDS = {
     STREET_PREFLOP: 0,

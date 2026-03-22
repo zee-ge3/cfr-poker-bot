@@ -12,20 +12,13 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from nlhe.game import NLHEGame, GameState, STREET_PREFLOP, STREET_FLOP, STREET_TURN, STREET_RIVER
+from nlhe.game import NLHEGame, GameState, STREET_PREFLOP, STREET_NAMES
 from nlhe.bot import Bot
 
 st.set_page_config(page_title="NLHE CFR-D Bot", layout="centered")
 
 SUIT_SYMBOLS = {'s': '♠', 'h': '♥', 'd': '♦', 'c': '♣'}
 SUIT_COLORS  = {'s': '#000000', 'h': '#cc0000', 'd': '#cc0000', 'c': '#000000'}
-
-STREET_NAMES = {
-    STREET_PREFLOP: 'Preflop',
-    STREET_FLOP:    'Flop',
-    STREET_TURN:    'Turn',
-    STREET_RIVER:   'River',
-}
 
 def fmt_card(c: str) -> str:
     """Format a treys card string as colored HTML."""
