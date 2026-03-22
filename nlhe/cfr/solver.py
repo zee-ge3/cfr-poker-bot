@@ -21,8 +21,6 @@ import time
 from typing import Optional
 
 import numpy as np
-from treys import Card as _TreysCard, Evaluator as _TreysEvaluator
-
 from nlhe.cfr.abstraction import (
     ALL_HANDS,
     HAND_TO_IDX,
@@ -38,10 +36,6 @@ from nlhe.game import GameState, STREET_RIVER
 # ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
-
-_evaluator = _TreysEvaluator()
-_RANK_CHARS = '23456789TJQKA'
-_SUIT_CHARS = 'cdhs'
 
 # CFV veto threshold: actions whose estimated CFV falls this far below the
 # best action CFV are excluded from the avg_strategy blend.
@@ -79,7 +73,6 @@ class NLHESolver:
         self.our_hole_idx: tuple[int, int] = tuple(
             sorted(card_str_to_idx(c) for c in our_hole)
         )
-        self.our_hand_idx: int = HAND_TO_IDX.get(self.our_hole_idx, 0)
 
         # Opponent range: (1326,) float32, uniform over live combos
         self.opp_range: np.ndarray = self._build_initial_range(state)
@@ -121,6 +114,10 @@ class NLHESolver:
         regret_sum = np.zeros(n_actions, dtype=np.float32)
         strategy_sum = np.zeros(n_actions, dtype=np.float32)
 
+        # With fixed action CFVs (equity is computed once and does not change across
+        # iterations), regret-matching converges in ~10 iterations. The time budget
+        # is retained here for future extension to per-hand game-tree CFR, where
+        # action CFVs would vary per iteration and require longer runtime.
         deadline = time.monotonic() + self.budget
         t = 0
 
@@ -153,7 +150,7 @@ class NLHESolver:
         # Select action: CFV veto + avg_strategy blend
         return self._select_action(actions, action_cfvs, avg_strategy)
 
-    def observe_action(self, action: str, amount: float = 0.0) -> None:
+    def observe_action(self, action: str) -> None:
         """
         Update opp_range after the opponent acts.
 
@@ -175,8 +172,6 @@ class NLHESolver:
         ----------
         action : str
             The action string the opponent took.
-        amount : float
-            The raise amount, if applicable (currently unused).
         """
         # If we haven't solved yet, just re-apply dead-card zeroing and renormalize
         if self._avg_strategy is None:
@@ -290,6 +285,11 @@ class NLHESolver:
           - CALL/CHECK:     equity * pot
           - RAISE actions:  fold_equity * pot_after_raise + call_equity_estimate
 
+        Note: FOLD's CFV is intentionally set to 0.0, making it structurally
+        dominated by CALL in all non-negative-equity situations. This is a
+        deliberate design choice: the solver should never prefer folding over
+        calling when our equity is positive, which is the correct GTO baseline.
+
         Returns
         -------
         np.ndarray
@@ -316,8 +316,8 @@ class NLHESolver:
             if action == 'FOLD':
                 cfvs[i] = 0.0
 
-            elif action in ('CALL', 'CHECK'):
-                # Expected value of calling/checking: equity * pot
+            elif action == 'CALL':
+                # Expected value of calling: equity * pot
                 cfvs[i] = equity * pot
 
             elif action == 'RAISE_SMALL':
