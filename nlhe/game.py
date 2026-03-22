@@ -158,25 +158,22 @@ class NLHEGame:
 
         self._pot = sb_post + bb_post
 
-        # After blinds: the open bet is BB (2) minus what SB put in (1) = 1
-        # SB still owes 1 to call, so current_bet from SB's perspective = 1
-        # But we track current_bet as "amount the current actor must add to call"
-        # The SB has already invested 1, BB has invested 2, so current_bet = 1
-        # for the next actor.
-        #
-        # We model it differently: current_bet is the SIZE of the outstanding bet
-        # (not the net amount to call). After blinds the live bet size is 2 (BB),
-        # and SB has already put in 1, so SB must call 1 more.  We'll store
-        # current_bet as the total bet amount outstanding and track per-actor
-        # contributions separately.
-        #
-        # Simpler model: track _to_call — the extra chips the current actor
-        # must put in.  After blinds:
-        #   SB put in 1, BB put in 2.  SB is first to act preflop.
-        #   SB must call 1 more to match BB's 2.
+        # After blinds: SB put in 1, BB put in 2.  SB acts first preflop.
+        # SB must call 1 more to match BB's 2.
+        # _street_contrib[i] tracks how much player i has invested this street.
+        # _to_call is always the net additional chips the current actor must add.
         self._to_call: int = 1   # SB must call 1 more
         self._street_bets  = [sb_post, bb_post]
         self._actions_this_street = 0
+
+        # Per-player street contributions (index 0=human, 1=bot).
+        # Used to compute _to_call correctly after raises.
+        if self._human_pos == 0:
+            # Human is SB: contributed sb_post; bot is BB: contributed bb_post
+            self._street_contrib: list = [sb_post, bb_post]
+        else:
+            # Human is BB: contributed bb_post; bot is SB: contributed sb_post
+            self._street_contrib: list = [bb_post, sb_post]
 
         # Preflop: SB / BTN (position 0) acts first
         # After blinds, actors alternate starting with position 0 (SB)
@@ -191,12 +188,14 @@ class NLHEGame:
 
     def human_action(self, action: str, raise_amount: int = 0) -> dict:
         """Process a human action. Returns result dict."""
-        assert self._actor == 0, "Not human's turn"
+        if self._actor != 0:
+            raise RuntimeError("Not human's turn")
         return self._process_action(actor=0, action=action, raise_amount=raise_amount)
 
     def bot_action(self, action: str, raise_amount: int = 0) -> dict:
         """Process a bot action. Returns result dict."""
-        assert self._actor == 1, "Not bot's turn"
+        if self._actor != 1:
+            raise RuntimeError("Not bot's turn")
         return self._process_action(actor=1, action=action, raise_amount=raise_amount)
 
     def _force_street(self, street: int) -> None:
@@ -214,6 +213,7 @@ class NLHEGame:
         self._to_call = 0
         self._street_bets = []
         self._actions_this_street = 0
+        self._street_contrib = [0, 0]
 
         # Post-flop: BB acts first (position 1)
         # After _force_street the next caller decides who acts;
@@ -318,6 +318,7 @@ class NLHEGame:
             setattr(self, actor_stack_attr, actor_stack - chips)
             self._pot       += chips
             self._street_bets.append(chips)
+            self._street_contrib[actor] += chips
             self._to_call    = 0
             self._actions_this_street += 1
 
@@ -355,11 +356,16 @@ class NLHEGame:
             setattr(self, actor_stack_attr, actor_stack - chips)
             self._pot        += chips
             self._street_bets.append(chips)
-            self._to_call     = chips   # opponent must call `chips` (simplified: opponent needs to call the raise amount)
+            self._street_contrib[actor] += chips
             self._actions_this_street += 1
 
+            # _to_call for the opponent is the net additional chips they must add
+            # to match the raiser's total street investment.
+            opponent = 1 - actor
+            self._to_call = self._street_contrib[actor] - self._street_contrib[opponent]
+
             # Switch to opponent
-            self._actor = 1 - actor
+            self._actor = opponent
             return {'hand_over': False, 'street': self._street, 'state': self._get_state()}
 
         else:
@@ -382,6 +388,7 @@ class NLHEGame:
         self._to_call             = 0
         self._street_bets         = []
         self._actions_this_street = 0
+        self._street_contrib      = [0, 0]
 
         # Post-flop: BB acts first (position 1 relative to table)
         # Human is BB when human_pos == 1 → human acts first post-flop
