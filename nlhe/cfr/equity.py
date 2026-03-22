@@ -104,7 +104,8 @@ def equity_river_exact(our_hole: list[str], board: list[str]) -> float:
     -------
     float : (wins + 0.5 * ties) / total_opponents
     """
-    assert len(board) == 5, "equity_river_exact requires exactly 5 board cards"
+    if len(board) != 5:
+        raise ValueError(f"equity_river_exact requires exactly 5 board cards, got {len(board)}")
 
     our_treys = _cards_to_treys(our_hole)
     board_treys = _cards_to_treys(board)
@@ -236,7 +237,6 @@ def equity_vs_range(
     nonzero_mask = masked > 0.0
     nz_hand_idxs = hand_indices[nonzero_mask]
     nz_weights = masked[nonzero_mask]
-    nz_weights /= nz_weights.sum()
 
     wins = ties = 0
     for _ in range(n_samples):
