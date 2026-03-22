@@ -1,6 +1,6 @@
 # Heads-Up No-Limit Texas Hold'em / CFR-D Solver
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](STREAMLIT_URL_HERE)
+**Live demo:** [poker.georgez.xyz](https://poker.georgez.xyz)
 
 Heads-up NLHE is one of the canonical benchmark problems in game-theoretic AI.
 The game tree has around 10^160 possible states, which rules out exact solving.
@@ -8,7 +8,7 @@ This project implements depth-limited CFR-D (Counterfactual Regret Decomposition
 with an equity-based value function to compute approximate Nash equilibrium strategies
 in real time.
 
-**Play it live:** [STREAMLIT_URL_HERE]
+**Play it live:** [https://poker.georgez.xyz]
 
 ---
 
