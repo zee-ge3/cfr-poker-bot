@@ -204,7 +204,7 @@ def test_solver_observe_action_updates_range():
     range_before = solver.opp_range.copy()
 
     # Observing a raise action should update the range
-    solver.observe_action('RAISE_LARGE', amount=7.5)
+    solver.observe_action('RAISE_LARGE')
 
     range_after = solver.opp_range.copy()
 
@@ -231,7 +231,7 @@ def test_solver_observe_action_without_solve():
     range_before = solver.opp_range.copy()
 
     # Should not crash even without avg_strategy
-    solver.observe_action('CALL', amount=0.0)
+    solver.observe_action('CALL')
 
     range_after = solver.opp_range.copy()
 
@@ -240,3 +240,52 @@ def test_solver_observe_action_without_solve():
     assert abs(total - 1.0) < 1e-4, (
         f"opp_range after observe_action (no solve) should sum to 1.0, got {total:.6f}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 6: single-action early return path
+# ---------------------------------------------------------------------------
+
+def test_solver_single_action_returns_it():
+    """When only one valid action exists, solve() returns it without running CFR."""
+    from nlhe.cfr.solver import NLHESolver
+
+    state = GameState(
+        street=STREET_RIVER,
+        pot=20,
+        our_stack=80,
+        opp_stack=80,
+        our_hole=['As', 'Ac'],
+        opp_hole=[],
+        board=['Kd', '5s', '2c', '7h', 'Qh'],
+        valid_actions=['CALL'],  # only one valid action
+        position=0,
+        street_bets=[],
+    )
+    solver = NLHESolver(state, our_hole=['As', 'Ac'], budget_seconds=0.1)
+    action = solver.solve()
+    assert action == 'CALL'
+    assert solver._avg_strategy is not None
+    assert solver._avg_strategy.shape == (1,)
+    assert abs(solver._avg_strategy[0] - 1.0) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Test 7: observe_action called twice sequentially stays valid
+# ---------------------------------------------------------------------------
+
+def test_solver_observe_action_twice_stays_valid():
+    """Two sequential observe_action calls should not collapse the range."""
+    from nlhe.cfr.solver import NLHESolver
+
+    state = make_flop_state()
+    solver = NLHESolver(state, our_hole=['As', 'Ac'], budget_seconds=0.2)
+    solver.solve()
+
+    solver.observe_action('RAISE_LARGE')
+    solver.observe_action('CALL')
+
+    total = solver.opp_range.sum()
+    assert abs(total - 1.0) < 1e-4, f"opp_range after 2 observe_action calls should sum to 1.0, got {total:.6f}"
+    # Range should still have some live entries
+    assert (solver.opp_range > 0).any(), "opp_range should not be all-zero after 2 observe_action calls"
