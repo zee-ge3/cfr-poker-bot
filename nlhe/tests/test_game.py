@@ -59,15 +59,14 @@ def test_new_hand_creates_valid_state():
 # ---------------------------------------------------------------------------
 
 def test_valid_actions_includes_fold_when_bet():
-    """FOLD is in valid_actions when there is a bet to call (preflop, BB faces SB raise)."""
+    """FOLD is in valid_actions when there is a bet to call (preflop, SB faces BB's live bet)."""
     game = NLHEGame(starting_stack=100)
-    # human_position=1 means human is BB; bot is SB and acts first preflop
+    # human_position=1 means human is BB; bot is SB and acts first preflop.
     state = game.new_hand(human_position=1)
 
-    # On preflop, SB has already posted 1 and BB has posted 2.
-    # BB is the human (position=1). BTN/SB acts first preflop.
-    # The current_bet for human (BB) is 1 (needs to call 1 more or raise).
-    # FOLD must be available since there is a live bet to the BB.
+    # On preflop, SB posted 1 and BB posted 2.  Bot is SB and acts first.
+    # state.valid_actions reflects the current actor's (bot/SB's) options.
+    # SB must call 1 more to match BB's blind, so FOLD must be available.
     assert 'FOLD' in state.valid_actions
 
 
@@ -106,19 +105,19 @@ def test_fold_ends_hand():
 
 
 def test_fold_when_no_bet_raises_or_converts():
-    """FOLD when no bet outstanding should be treated as CHECK (or raise ValueError)."""
+    """FOLD when no bet outstanding is converted to CHECK by the engine (hand continues)."""
     game = NLHEGame(starting_stack=100)
-    game.new_hand(human_position=0)
+    # human_position=1 means human is BB → human acts first post-flop
+    game.new_hand(human_position=1)
     game._force_street(STREET_FLOP)
 
-    # On flop with no bet, FOLD is invalid — engine should either raise or convert to CHECK
-    # We accept either behaviour; just verify hand is not spuriously ended
-    try:
-        result = game.human_action('FOLD')
-        # If it didn't raise, it should have treated as CHECK (hand not over unless it somehow ended)
-        # Permissive: accept that it converts to CHECK or errors
-    except (ValueError, AssertionError):
-        pass  # This is fine
+    # On flop with no bet, FOLD is not in valid_actions.
+    # The engine converts FOLD → CALL (i.e. CHECK) silently when _to_call == 0.
+    # So the hand should NOT end immediately; it should continue with opponent to act.
+    result = game.human_action('FOLD')
+    assert result['hand_over'] is False, (
+        "Engine must convert FOLD-when-no-bet to CHECK; hand should continue"
+    )
 
 
 # ---------------------------------------------------------------------------
