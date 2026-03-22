@@ -93,8 +93,8 @@ def _fold_ev(pot: float, stack_sb: float, stack_bb: float,
         # SB folds — SB loses their investment
         return -(STARTING_STACK - stack_sb)
     else:
-        # BB folds — SB wins the pot
-        return STARTING_STACK - stack_sb  # net = pot - invested_sb = +invested_bb
+        # BB folds — SB wins the pot; net = pot - what SB invested
+        return pot - (STARTING_STACK - stack_sb)
 
 
 # ---------------------------------------------------------------------------
@@ -180,13 +180,16 @@ class _PreflopCFR:
 
         # RE-RAISE actions (BB re-raises)
         for a in (RAISE_SMALL, RAISE_LARGE, RAISE_ALLIN):
-            reraise_chips = _raise_size(a, pot, bb)
-            # BB must first call the facing bet, then raise on top
-            total_bb_invest = min(reraise_chips, bb)
+            # BB must first call `facing`, then raise on top of the new pot
+            call_amount   = min(facing, bb)
+            bb_after_call = bb - call_amount
+            pot_after_call = pot + call_amount
+            reraise_chips = _raise_size(a, pot_after_call, bb_after_call)
+            total_bb_invest = min(call_amount + reraise_chips, bb)
             new_bb2   = bb - total_bb_invest
             new_pot3  = pot + total_bb_invest
             # SB responds at node 2
-            ev_actions[a] = self._node2(t, sb, new_bb2, new_pot3, total_bb_invest)
+            ev_actions[a] = self._node2(t, sb, new_bb2, new_pot3, total_bb_invest - call_amount)
 
         node_ev = float(strat @ ev_actions)
         # Note: node_ev is SB's EV; BB's EV = −node_ev
