@@ -1,0 +1,13 @@
+[Unit]
+Description=NLHE CFR-D Poker Demo
+After=network.target
+
+[Service]
+User=g30rgez
+WorkingDirectory=/home/g30rgez/poker/poker-engine-2026
+ExecStart=/home/g30rgez/miniconda3/bin/uvicorn nlhe.demo.fastapi_app:app --host 127.0.0.1 --port 8502
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

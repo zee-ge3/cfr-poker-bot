@@ -1,0 +1,45 @@
+<form hx-post="/solve" hx-target="#solve-result" hx-swap="innerHTML" hx-indicator="#solve-spinner">
+  <div class="form-row">
+    <div class="form-group">
+      <label>Your card 1</label>
+      <select name="hole1" id="hole1">
+        {% for c in all_cards %}<option value="{{ c }}" {% if c == 'As' %}selected{% endif %}>{{ c }}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Your card 2</label>
+      <select name="hole2" id="hole2">
+        {% for c in all_cards %}<option value="{{ c }}" {% if c == 'Kd' %}selected{% endif %}>{{ c }}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Position</label>
+      <select name="position">
+        <option value="0">SB (acts first)</option>
+        <option value="1">BB</option>
+      </select>
+    </div>
+  </div>
+  <div class="form-row">
+    <div class="form-group" style="flex:3">
+      <label>Board cards (leave blank for preflop)</label>
+      <select name="board" multiple size="3" style="height:auto">
+        {% for c in all_cards %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+      </select>
+      <div style="font-size:0.75rem;color:#999;margin-top:3px">Ctrl/Cmd+click to select 3-5 cards</div>
+    </div>
+    <div class="form-group" style="flex:2">
+      <label>Pot: <span id="pot-val">20</span> chips</label>
+      <input type="range" name="pot" min="2" max="200" value="20"
+             oninput="document.getElementById('pot-val').textContent=this.value">
+      <label style="margin-top:10px">Stack: <span id="stack-val">80</span> chips</label>
+      <input type="range" name="stack" min="1" max="200" value="80"
+             oninput="document.getElementById('stack-val').textContent=this.value">
+    </div>
+  </div>
+  <button type="submit" class="btn btn-primary">
+    <span id="solve-spinner" class="htmx-indicator"><span class="spinner"></span></span>
+    Solve
+  </button>
+</form>
+<div id="solve-result" class="solve-result"></div>
