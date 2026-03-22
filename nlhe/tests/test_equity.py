@@ -65,12 +65,12 @@ def test_river_equity_pair_vs_nothing():
 
 
 def test_river_equity_nuts():
-    """A royal flush draw with the nuts should have equity near 1.
+    """A straight flush (the nuts) should have equity near 1.
 
     Board: Kh Qh Jh Th 2c (river)
-    Our hole: Ah Xh — but we don't have another heart.
-    Use a made straight flush: Ah + 9h on Kh Qh Jh Th 2c
-    We have a royal flush (A-K-Q-J-T all hearts) → should be near nuts.
+    Our hole: Ah 9h
+    We have a royal flush (A-K-Q-J-T all hearts), which is the best possible hand.
+    No opponent can beat or tie this hand on this board.
     """
     our_hole = ['Ah', '9h']
     board = ['Kh', 'Qh', 'Jh', 'Th', '2c']
@@ -110,10 +110,10 @@ def test_mc_equity_preflop():
 
 
 def test_uniform_range_equity_sum():
-    """For a river spot, our equity + opponent's equity == 1.0 (no draws).
+    """equity_vs_range is consistent with exact river equity.
 
-    We compute equity_vs_range with uniform range, then swap and recheck.
-    Because this is exact win/tie/loss, our_eq + opp_eq == 1.0.
+    On a river board, equity_vs_range with a uniform opponent range
+    should match equity_river_exact (up to Monte Carlo variance).
     """
     our_hole = ['Ah', 'Ac']
     board = ['Ks', '5d', '2h', '7c', 'Qd']
@@ -121,7 +121,7 @@ def test_uniform_range_equity_sum():
     # Build uniform range (equal weight for all hands)
     opp_range = np.ones(1326, dtype=np.float32)
     # Zero out hands that conflict with our cards or the board
-    from nlhe.cfr.abstraction import ALL_HANDS, HAND_TO_IDX
+    from nlhe.cfr.abstraction import ALL_HANDS
     from nlhe.cfr.equity import card_str_to_idx
     dead_idxs = {card_str_to_idx(c) for c in our_hole + board}
     for i, (c1, c2) in enumerate(ALL_HANDS):
@@ -129,22 +129,12 @@ def test_uniform_range_equity_sum():
             opp_range[i] = 0.0
     opp_range /= opp_range.sum()
 
+    # Compute equity via range and via exact enumeration
     our_eq = equity_vs_range(our_hole, board, opp_range, n_samples=4000)
+    exact_eq = equity_river_exact(our_hole, board)
 
-    # Now compute opponent's equity with uniform range for us
-    our_range = np.ones(1326, dtype=np.float32)
-    dead_idxs_for_opp = {card_str_to_idx(c) for c in board}  # opp cards unknown
-    # If opponent is 'Kd 5c' as a placeholder, just use uniform over all non-board
-    for i, (c1, c2) in enumerate(ALL_HANDS):
-        if c1 in dead_idxs_for_opp or c2 in dead_idxs_for_opp:
-            our_range[i] = 0.0
-
-    # The basic invariant: equity is bounded in [0, 1]
+    # On a river board with enough samples, these should match closely
     assert 0.0 <= our_eq <= 1.0, f"equity_vs_range returned {our_eq} outside [0,1]"
-
-    # For a river board, exact = equity_river_exact with same uniform assumption
-    # MC should be close to exact
-    exact = equity_river_exact(our_hole, board)
-    assert abs(our_eq - exact) < 0.06, (
-        f"equity_vs_range ({our_eq:.4f}) too far from river exact ({exact:.4f})"
+    assert abs(our_eq - exact_eq) < 0.06, (
+        f"equity_vs_range ({our_eq:.4f}) should match equity_river_exact ({exact_eq:.4f})"
     )
