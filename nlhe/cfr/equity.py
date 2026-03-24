@@ -13,6 +13,7 @@ idx_to_treys      : 0-51 index -> treys card integer
 equity_river_exact: exact equity enumeration on a 5-card board
 equity_mc         : Monte Carlo equity (0-4 board cards)
 equity_vs_range   : equity vs a weighted opponent range
+equity_vs_range_batch : per-hand (1326,) equity against weighted opponent range
 """
 
 from __future__ import annotations
@@ -39,6 +40,25 @@ _ALL_TREYS_CARDS: list[int] = [
 
 # Module-level evaluator — do not create a new Evaluator per call
 _evaluator = Evaluator()
+
+# Precomputed tables for vectorized equity_vs_range_batch (lazy init)
+_CARD_IN_HAND: np.ndarray | None = None   # (52, 1326) uint8
+_HAND_CONFLICT: np.ndarray | None = None  # (1326, 1326) bool
+
+
+def _ensure_hand_tables():
+    """Build card-membership and hand-conflict matrices (computed once)."""
+    global _CARD_IN_HAND, _HAND_CONFLICT
+    if _CARD_IN_HAND is not None:
+        return
+    from nlhe.cfr.abstraction import ALL_HANDS
+    arr = np.array(ALL_HANDS, dtype=np.int32)  # (1326, 2)
+    c1, c2 = arr[:, 0], arr[:, 1]
+    cih = np.zeros((52, 1326), dtype=np.uint8)
+    for c in range(52):
+        cih[c] = ((c1 == c) | (c2 == c)).astype(np.uint8)
+    _CARD_IN_HAND = cih
+    _HAND_CONFLICT = (cih.T @ cih) > 0  # (1326, 1326) bool
 
 # ---------------------------------------------------------------------------
 # Index conversion helpers
@@ -264,3 +284,231 @@ def equity_vs_range(
             ties += 1
 
     return (wins + 0.5 * ties) / n_samples
+
+
+# ---------------------------------------------------------------------------
+# equity_vs_range_batch
+# ---------------------------------------------------------------------------
+
+def equity_vs_range_batch(
+    board: list[str],
+    opp_range: np.ndarray,
+    n_samples: int = 500,
+) -> np.ndarray:
+    """Per-hand equity against a weighted opponent range.
+
+    For each of the 1326 possible hero hands, compute equity against
+    *opp_range* on the given board. Hands that conflict with the board
+    get equity 0.
+
+    River (5-card board): vectorized exact enumeration using precomputed
+    hand scores and matrix operations.
+    Non-river: Monte Carlo with vectorized opponent masking.
+
+    Parameters
+    ----------
+    board     : list of 0-5 card strings
+    opp_range : (1326,) float32 opponent range weights (need not sum to 1)
+    n_samples : MC samples per hero hand (ignored on river)
+
+    Returns
+    -------
+    (1326,) float32 equity for each hero hand
+    """
+    from nlhe.cfr.abstraction import ALL_HANDS
+    _ensure_hand_tables()
+
+    board_idxs = {_STR_TO_IDX[c] for c in board}
+    board_treys = _cards_to_treys(board)
+    is_river = len(board) == 5
+    runout_needed = 5 - len(board)
+
+    # Board-blocked hands mask
+    board_blocked = np.zeros(1326, dtype=bool)
+    for c in board_idxs:
+        board_blocked |= _CARD_IN_HAND[c].astype(bool)
+
+    # Opponent range with board-blocked hands zeroed
+    opp_w = opp_range.astype(np.float64).copy()
+    opp_w[board_blocked] = 0.0
+
+    if is_river:
+        # --- Fully vectorized river computation ---
+        # Evaluate all non-blocked hands once (~990 evals vs ~990k before)
+        hand_scores = np.full(1326, 99999, dtype=np.int32)
+        for idx in range(1326):
+            if not board_blocked[idx]:
+                c1, c2 = ALL_HANDS[idx]
+                hand_scores[idx] = _evaluator.evaluate(
+                    board_treys,
+                    [_ALL_TREYS_CARDS[c1], _ALL_TREYS_CARDS[c2]],
+                )
+
+        # Effective opp weights: zero where hero-opp hands share cards
+        eff_opp = np.where(~_HAND_CONFLICT, opp_w[None, :], 0.0)  # (1326, 1326)
+
+        # Payoff matrix (lower treys score = stronger hand)
+        hs = hand_scores
+        payoff = np.where(
+            hs[:, None] < hs[None, :], 1.0,
+            np.where(hs[:, None] == hs[None, :], 0.5, 0.0),
+        )
+
+        numerator = (eff_opp * payoff).sum(axis=1)
+        denominator = eff_opp.sum(axis=1)
+
+        equities = np.where(
+            denominator > 0, numerator / denominator, 0.5,
+        ).astype(np.float32)
+        equities[board_blocked] = 0.0
+        return equities
+
+    # --- Vectorized MC path (flop / turn) ---
+    # Sample board completions, then do exact vectorized enumeration for each.
+    # Each runout evaluates ALL opponent hands (not just one sampled hand),
+    # so n_samples runouts gives accuracy equivalent to n_samples * ~1000 MC.
+    n_runouts = max(10, n_samples)
+    equities_sum = np.zeros(1326, dtype=np.float64)
+    valid_count = np.zeros(1326, dtype=np.float64)
+
+    live_for_runout = [i for i in range(52) if i not in board_idxs]
+
+    for _ in range(n_runouts):
+        runout = random.sample(live_for_runout, runout_needed)
+        full_board_treys = board_treys + [_ALL_TREYS_CARDS[c] for c in runout]
+
+        # Hands blocked by the complete board (original board + runout)
+        full_blocked = board_blocked.copy()
+        for c in runout:
+            full_blocked |= _CARD_IN_HAND[c].astype(bool)
+
+        # Evaluate all non-blocked hands on this complete board
+        hand_scores = np.full(1326, 99999, dtype=np.int32)
+        for idx in range(1326):
+            if not full_blocked[idx]:
+                c1, c2 = ALL_HANDS[idx]
+                hand_scores[idx] = _evaluator.evaluate(
+                    full_board_treys,
+                    [_ALL_TREYS_CARDS[c1], _ALL_TREYS_CARDS[c2]],
+                )
+
+        # Opponent range with runout blocking
+        opp_for_runout = opp_w.copy()
+        opp_for_runout[full_blocked] = 0.0
+
+        # Effective opp weights (zero where hero-opp share cards)
+        eff_opp = np.where(~_HAND_CONFLICT, opp_for_runout[None, :], 0.0)
+
+        # Payoff matrix
+        hs = hand_scores
+        payoff = np.where(
+            hs[:, None] < hs[None, :], 1.0,
+            np.where(hs[:, None] == hs[None, :], 0.5, 0.0),
+        )
+
+        numerator = (eff_opp * payoff).sum(axis=1)
+        denominator = eff_opp.sum(axis=1)
+
+        eq_this = np.where(denominator > 0, numerator / denominator, 0.5)
+
+        # Accumulate only for non-blocked hero hands
+        valid_hero = ~full_blocked
+        equities_sum[valid_hero] += eq_this[valid_hero]
+        valid_count[valid_hero] += 1.0
+
+    valid = valid_count > 0
+    equities = np.full(1326, 0.5, dtype=np.float32)
+    equities[valid] = (equities_sum[valid] / valid_count[valid]).astype(np.float32)
+    equities[board_blocked] = 0.0
+    return equities
+
+def compute_matchup_matrix(board: list[str], n_samples: int = 20) -> np.ndarray:
+    """Compute (1326, 1326) equity matrix for all hero hands vs all opp hands.
+    Returns M where M[i, j] is the equity of hero hand i against opp hand j.
+    M[i, j] = 0 if hands conflict or conflict with the board.
+    """
+    import os
+    from nlhe.cfr.abstraction import ALL_HANDS, HAND_BUCKET
+    _ensure_hand_tables()
+    
+    if len(board) == 0:
+        # Preflop: load precomputed 169x169 exact Monte Carlo matrix and map it to 1326x1326
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(base_dir, "tables", "equity_matrix_169.npy")
+        if os.path.exists(path):
+            eq_169 = np.load(path)
+            # Map 169x169 to 1326x1326 using HAND_BUCKET
+            M = eq_169[HAND_BUCKET[:, None], HAND_BUCKET[None, :]]
+            M = np.where(~_HAND_CONFLICT, M, 0.0)
+            return M.astype(np.float32)
+
+    board_idxs = {_STR_TO_IDX[c] for c in board}
+    board_treys = _cards_to_treys(board)
+    is_river = len(board) == 5
+    runout_needed = 5 - len(board)
+
+    board_blocked = np.zeros(1326, dtype=bool)
+    for c in board_idxs:
+        board_blocked |= _CARD_IN_HAND[c].astype(bool)
+
+    if is_river:
+        hand_scores = np.full(1326, 99999, dtype=np.int32)
+        for idx in range(1326):
+            if not board_blocked[idx]:
+                c1, c2 = ALL_HANDS[idx]
+                hand_scores[idx] = _evaluator.evaluate(
+                    board_treys,
+                    [_ALL_TREYS_CARDS[c1], _ALL_TREYS_CARDS[c2]],
+                )
+
+        hs = hand_scores
+        payoff = np.where(
+            hs[:, None] < hs[None, :], 1.0,
+            np.where(hs[:, None] == hs[None, :], 0.5, 0.0),
+        )
+        M = np.where(~_HAND_CONFLICT, payoff, 0.0)
+        M[board_blocked, :] = 0.0
+        M[:, board_blocked] = 0.0
+        return M.astype(np.float32)
+
+    n_runouts = max(10, n_samples)
+    live_for_runout = [i for i in range(52) if i not in board_idxs]
+    
+    M_sum = np.zeros((1326, 1326), dtype=np.float32)
+    Count = np.zeros((1326, 1326), dtype=np.float32)
+
+    for _ in range(n_runouts):
+        runout = random.sample(live_for_runout, runout_needed)
+        full_board_treys = board_treys + [_ALL_TREYS_CARDS[c] for c in runout]
+
+        full_blocked = board_blocked.copy()
+        for c in runout:
+            full_blocked |= _CARD_IN_HAND[c].astype(bool)
+
+        hand_scores = np.full(1326, 99999, dtype=np.int32)
+        for idx in range(1326):
+            if not full_blocked[idx]:
+                c1, c2 = ALL_HANDS[idx]
+                hand_scores[idx] = _evaluator.evaluate(
+                    full_board_treys,
+                    [_ALL_TREYS_CARDS[c1], _ALL_TREYS_CARDS[c2]],
+                )
+
+        hs = hand_scores
+        payoff = np.where(
+            hs[:, None] < hs[None, :], 1.0,
+            np.where(hs[:, None] == hs[None, :], 0.5, 0.0),
+        )
+        
+        valid_mask = ~_HAND_CONFLICT.copy()
+        valid_mask[full_blocked, :] = False
+        valid_mask[:, full_blocked] = False
+        
+        M_sum[valid_mask] += payoff[valid_mask]
+        Count[valid_mask] += 1.0
+
+    M = np.where(Count > 0, M_sum / Count, 0.5)
+    M[board_blocked, :] = 0.0
+    M[:, board_blocked] = 0.0
+    M[_HAND_CONFLICT] = 0.0
+    return M.astype(np.float32)

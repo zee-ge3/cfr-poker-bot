@@ -63,6 +63,7 @@ class GameState:
     valid_actions: list   # subset of action-name strings
     position: int         # 0=BTN/SB acts first preflop, 1=BB
     street_bets: list     # ordered sequence of individual bet amounts this street
+    to_call: int = 0      # outstanding bet hero must match (0 if no bet)
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +254,7 @@ class NLHEGame:
             valid_actions= valid,
             position     = self._human_pos,
             street_bets  = list(self._street_bets),
+            to_call      = self._to_call,
         )
 
     # ------------------------------------------------------------------
@@ -333,7 +335,12 @@ class NLHEGame:
             # A call ends the street when chips > 0 (there was a bet to call)
             # A check (chips == 0) needs both players to have checked.
             if chips > 0:
-                # Call ends the betting round
+                # Preflop special case: SB limping doesn't end the street.
+                # BB still gets the option to check or raise.
+                if self._street == STREET_PREFLOP and self._actions_this_street < 2:
+                    self._actor = 1 - actor
+                    return {'hand_over': False, 'street': self._street, 'state': self._get_state()}
+                # Otherwise a call ends the betting round
                 return self._advance_street_or_showdown()
             else:
                 # This was a CHECK; need opponent to also check
